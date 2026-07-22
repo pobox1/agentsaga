@@ -8,6 +8,8 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
+    "generate:abi": "node scripts/generate-abi.mjs",
+    "check:abi": "node scripts/check-abi.mjs",
     "verify:deployment": "tsx src/verify-deployment.ts",
     "lint": "tsc --noEmit",
     "test": "tsc --noEmit",

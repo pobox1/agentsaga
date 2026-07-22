@@ -203,7 +203,11 @@ contract WorkflowFactory {
         uint256 roots;
         for (uint8 i; i < nodes.length; ++i) {
             WorkflowCoordinator.NodeInput calldata input = nodes[i];
-            policyRegistry.validateNode(input.provider, input.evaluator, input.budget);
+            policyRegistry.validateNode(
+                input.provider,
+                input.evaluator,
+                input.budget > input.compensationBudget ? input.budget : input.compensationBudget
+            );
             if (input.provider == address(0) || input.evaluator == address(0)) {
                 revert InvalidAddress();
             }

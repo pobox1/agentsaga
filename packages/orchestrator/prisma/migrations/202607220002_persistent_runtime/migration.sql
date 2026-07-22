@@ -1,0 +1,17 @@
+CREATE TABLE "Workflow" ("address" TEXT PRIMARY KEY, "chainId" INTEGER NOT NULL, "owner" TEXT NOT NULL, "paymentToken" TEXT, "status" TEXT NOT NULL, "totalBudget" TEXT, "nodeCount" INTEGER, "createdBlock" BIGINT NOT NULL, "finalizedBlock" BIGINT, "state" JSONB NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL);
+CREATE INDEX "Workflow_chainId_status_idx" ON "Workflow"("chainId", "status");
+CREATE INDEX "Workflow_owner_idx" ON "Workflow"("owner");
+CREATE TABLE "WorkflowNode" ("id" TEXT PRIMARY KEY, "workflowAddress" TEXT NOT NULL REFERENCES "Workflow"("address") ON DELETE CASCADE, "nodeId" INTEGER NOT NULL, "status" TEXT NOT NULL, "provider" TEXT, "evaluator" TEXT, "jobId" TEXT, "state" JSONB NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL);
+CREATE UNIQUE INDEX "WorkflowNode_workflowAddress_nodeId_key" ON "WorkflowNode"("workflowAddress", "nodeId");
+CREATE INDEX "WorkflowNode_workflowAddress_status_idx" ON "WorkflowNode"("workflowAddress", "status");
+CREATE TABLE "AgentExecution" ("id" TEXT PRIMARY KEY, "workflowAddress" TEXT NOT NULL REFERENCES "Workflow"("address") ON DELETE CASCADE, "nodeId" INTEGER NOT NULL, "agentId" TEXT NOT NULL, "status" TEXT NOT NULL, "input" JSONB NOT NULL, "output" JSONB, "evidenceHash" TEXT, "cost" TEXT, "error" TEXT, "startedAt" TIMESTAMP(3) NOT NULL, "completedAt" TIMESTAMP(3));
+CREATE INDEX "AgentExecution_workflowAddress_nodeId_idx" ON "AgentExecution"("workflowAddress", "nodeId");
+CREATE TABLE "EvaluatorDecision" ("id" TEXT PRIMARY KEY, "workflowAddress" TEXT NOT NULL REFERENCES "Workflow"("address") ON DELETE CASCADE, "nodeId" INTEGER NOT NULL, "evaluatorId" TEXT NOT NULL, "decision" TEXT NOT NULL, "reasonCode" TEXT NOT NULL, "evidenceHash" TEXT NOT NULL, "evaluatedAt" TIMESTAMP(3) NOT NULL);
+CREATE INDEX "EvaluatorDecision_workflowAddress_nodeId_idx" ON "EvaluatorDecision"("workflowAddress", "nodeId");
+CREATE TABLE "ChainTransaction" ("hash" TEXT PRIMARY KEY, "workflowAddress" TEXT REFERENCES "Workflow"("address") ON DELETE SET NULL, "chainId" INTEGER NOT NULL, "action" TEXT NOT NULL, "status" TEXT NOT NULL, "blockNumber" BIGINT, "fromAddress" TEXT, "toAddress" TEXT, "payload" JSONB NOT NULL, "submittedAt" TIMESTAMP(3) NOT NULL, "confirmedAt" TIMESTAMP(3));
+CREATE INDEX "ChainTransaction_workflowAddress_action_idx" ON "ChainTransaction"("workflowAddress", "action");
+CREATE TABLE "IdempotencyRecord" ("key" TEXT PRIMARY KEY, "operation" TEXT NOT NULL, "status" TEXT NOT NULL, "result" JSONB, "expiresAt" TIMESTAMP(3), "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL);
+CREATE TABLE "DeadLetterRecord" ("id" TEXT PRIMARY KEY, "queue" TEXT NOT NULL, "originalJobId" TEXT, "payload" JSONB NOT NULL, "error" TEXT NOT NULL, "attempts" INTEGER NOT NULL, "resolvedAt" TIMESTAMP(3), "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX "DeadLetterRecord_queue_resolvedAt_idx" ON "DeadLetterRecord"("queue", "resolvedAt");
+CREATE TABLE "EvidenceRecord" ("id" TEXT PRIMARY KEY, "workflowAddress" TEXT NOT NULL REFERENCES "Workflow"("address") ON DELETE CASCADE, "nodeId" INTEGER, "kind" TEXT NOT NULL, "commitment" TEXT NOT NULL, "uri" TEXT, "transactionHash" TEXT, "metadata" JSONB NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX "EvidenceRecord_workflowAddress_nodeId_idx" ON "EvidenceRecord"("workflowAddress", "nodeId");

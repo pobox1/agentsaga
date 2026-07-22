@@ -1,12 +1,19 @@
 import {
   createPublicClient,
+  decodeEventLog,
   http,
   type Address,
   type Hash,
   type Log,
   type PublicClient,
 } from "viem";
-import { arcTestnet } from "@agentsaga/contracts";
+import { arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi } from "@agentsaga/contracts";
+
+export const trackedEventNames = ["WorkflowCreated", "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated", "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned", "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded", "WorkflowReceiptFinalized"] as const;
+const trackedNames = new Set<string>(trackedEventNames);
+const trackedEventAbi = [...workflowFactoryAbi, ...workflowCoordinatorAbi, ...receiptRegistryAbi] as const;
+
+export interface DecodedIndexedEvent { eventName: string; payload: Record<string, unknown> }
 
 export interface BlockCursor {
   nextBlock: bigint;
@@ -17,7 +24,7 @@ export interface BlockCursor {
 export interface CursorStore {
   load(id: string): Promise<BlockCursor | undefined>;
   save(id: string, cursor: BlockCursor): Promise<void>;
-  putLogIfAbsent(id: string, log: Log): Promise<boolean>;
+  putLogIfAbsent(id: string, log: Log, decoded?: DecodedIndexedEvent): Promise<boolean>;
 }
 
 export class InMemoryCursorStore implements CursorStore {
@@ -32,7 +39,7 @@ export class InMemoryCursorStore implements CursorStore {
     this.cursors.set(id, cursor);
   }
 
-  async putLogIfAbsent(id: string, log: Log): Promise<boolean> {
+  async putLogIfAbsent(id: string, log: Log, _decoded?: DecodedIndexedEvent): Promise<boolean> {
     const key = `${id}:${log.transactionHash ?? "pending"}:${log.logIndex ?? -1}`;
     if (this.logs.has(key)) return false;
     this.logs.add(key);
@@ -87,7 +94,8 @@ export class ArcEventIndexer {
     });
     let inserted = 0;
     for (const log of logs) {
-      if (!(await this.store.putLogIfAbsent(this.options.id, log))) continue;
+      const decoded = decodeTrackedEvent(log);
+      if (!(await this.store.putLogIfAbsent(this.options.id, log, decoded))) continue;
       await this.onLog(log);
       inserted += 1;
     }
@@ -101,3 +109,14 @@ export class ArcEventIndexer {
   }
 }
 
+export function decodeTrackedEvent(log: Log): DecodedIndexedEvent | undefined {
+  try {
+    const decoded = decodeEventLog({ abi: trackedEventAbi, data: log.data, topics: log.topics, strict: false });
+    if (!trackedNames.has(decoded.eventName)) return undefined;
+    return { eventName: decoded.eventName, payload: jsonSafe({ address: log.address.toLowerCase(), args: decoded.args }) };
+  } catch { return undefined; }
+}
+
+function jsonSafe(value: unknown): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Record<string, unknown>;
+}

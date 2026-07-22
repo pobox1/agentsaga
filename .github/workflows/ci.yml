@@ -12,6 +12,7 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge fmt --check
       - run: forge build --sizes
+      - run: node packages/contracts/scripts/check-abi.mjs
       - run: forge test -vv
       - run: forge coverage --ir-minimum --report summary
       - run: forge snapshot --check
@@ -36,6 +37,8 @@ jobs:
       - run: pnpm -r lint
       - run: pnpm --filter @agentsaga/orchestrator test
       - run: pnpm --filter @agentsaga/web test
+      - run: pnpm deployment:validate
+      - run: pnpm audit --prod --audit-level high
       - run: pnpm --filter @agentsaga/web build
 
   secrets:

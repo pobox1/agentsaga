@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import {
   decodeEventLog,
@@ -19,6 +19,7 @@ import {
   ARC_TESTNET_USDC,
   workflowFactoryAbi,
 } from "@agentsaga/contracts";
+import { recoverPendingTransaction, trackPendingTransaction, type PendingTransaction } from "../lib/transactions";
 
 type BuilderNode = {
   name: string;
@@ -82,13 +83,6 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
   const walletClient = useWalletClient({ chainId: arcTestnet.id });
   const switchChain = useSwitchChain();
   const router = useRouter();
-
-  useEffect(() => {
-    const recovered = window.localStorage.getItem("agentsaga:pending:create");
-    if (/^0x[a-fA-F0-9]{64}$/.test(recovered ?? "")) {
-      queueMicrotask(() => setPendingHash(recovered as `0x${string}`));
-    }
-  }, []);
 
   const totals = useMemo(() => {
     try {
@@ -163,7 +157,17 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
       });
       const hash = await walletClient.data.writeContract(simulation.request);
       setPendingHash(hash);
-      window.localStorage.setItem("agentsaga:pending:create", hash);
+      const pending: PendingTransaction = {
+        version: 1,
+        action: "create-workflow",
+        chainId: arcTestnet.id,
+        hash,
+        createdAt: new Date().toISOString(),
+        expectedEvent: "WorkflowCreated",
+        expectedOwner: account.address,
+        from: account.address,
+      };
+      trackPendingTransaction(pending);
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       const created = receipt.logs.map((log) => {
         try { return decodeEventLog({ abi: workflowFactoryAbi, data: log.data, topics: log.topics }); }
@@ -175,7 +179,7 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
       window.localStorage.setItem(`agentsaga:workflow:${created.args.workflow}`, JSON.stringify({
         workflowId: created.args.workflowId.toString(), workflow: created.args.workflow, transactionHash: hash,
       }));
-      window.localStorage.removeItem("agentsaga:pending:create");
+      await recoverPendingTransaction(publicClient, pending);
       router.push(`/workflows/${created.args.workflow}`);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Invalid workflow");

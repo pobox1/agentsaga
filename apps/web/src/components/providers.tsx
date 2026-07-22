@@ -5,6 +5,7 @@ import { createConfig, http, WagmiProvider } from "wagmi";
 import { injected, walletConnect } from "wagmi/connectors";
 import { useState, type ReactNode } from "react";
 import { arcTestnet } from "@agentsaga/contracts";
+import { TransactionCenter } from "./transaction-center";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [queryClient] = useState(() => new QueryClient());
@@ -31,7 +32,7 @@ export function Providers({ children }: { children: ReactNode }) {
   });
   return (
     <WagmiProvider config={wagmiConfig}>
-      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      <QueryClientProvider client={queryClient}>{children}<TransactionCenter /></QueryClientProvider>
     </WagmiProvider>
   );
 }

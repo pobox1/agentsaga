@@ -9,6 +9,9 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1).optional(),
   REDIS_URL: z.string().min(1).optional(),
   ORCHESTRATOR_API_TOKEN: z.string().min(24).optional(),
+  CORS_ORIGINS: z.string().default("http://localhost:3000"),
+  CIRCLE_INTEGRATION_STATUS: z.enum(["not configured", "code integrated", "operator authentication required", "authenticated test environment", "test transaction verified"]).default("code integrated"),
+  X402_INTEGRATION_STATUS: z.enum(["local fixture only", "real testnet pending", "real testnet verified"]).default("local fixture only"),
   GIT_COMMIT_SHA: z.string().default("unknown"),
 }).superRefine((value, context) => {
   if (value.NODE_ENV !== "production") return;

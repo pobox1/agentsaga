@@ -3,6 +3,8 @@ import { optionalAddress } from "@agentsaga/contracts";
 export function publicConfig() {
   const config = {
     appUrl: process.env.NEXT_PUBLIC_APP_URL,
+    gitCommit: process.env.NEXT_PUBLIC_GIT_COMMIT,
+    orchestratorUrl: process.env.NEXT_PUBLIC_ORCHESTRATOR_URL,
     factoryAddress: optionalAddress(process.env.NEXT_PUBLIC_WORKFLOW_FACTORY_ADDRESS),
     receiptRegistryAddress: optionalAddress(
       process.env.NEXT_PUBLIC_RECEIPT_REGISTRY_ADDRESS,
@@ -14,6 +16,8 @@ export function publicConfig() {
   if (process.env.VERCEL_ENV === "production") {
     const missing = [
       ["NEXT_PUBLIC_APP_URL", config.appUrl],
+      ["NEXT_PUBLIC_GIT_COMMIT", config.gitCommit],
+      ["NEXT_PUBLIC_ORCHESTRATOR_URL", config.orchestratorUrl],
       ["NEXT_PUBLIC_WORKFLOW_FACTORY_ADDRESS", config.factoryAddress],
       ["NEXT_PUBLIC_RECEIPT_REGISTRY_ADDRESS", config.receiptRegistryAddress],
       ["NEXT_PUBLIC_ARC_RPC_URL", process.env.NEXT_PUBLIC_ARC_RPC_URL],

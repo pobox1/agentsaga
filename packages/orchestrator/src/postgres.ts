@@ -1,7 +1,7 @@
 import { PrismaClient, Prisma, type WorkerAction } from "@prisma/client";
 import type { AgentJobResult } from "./types.js";
 import type { ExecutionStore } from "./engine.js";
-import type { BlockCursor, CursorStore } from "./indexer.js";
+import type { BlockCursor, CursorStore, DecodedIndexedEvent } from "./indexer.js";
 import type { Log } from "viem";
 
 export const prisma = new PrismaClient();
@@ -29,10 +29,10 @@ export class PostgresCursorStore implements CursorStore {
   async save(id: string, cursor: BlockCursor) {
     await this.db.chainCursor.upsert({ where: { id }, create: { id, chainId: this.chainId, nextBlock: cursor.nextBlock, lastBlockHash: cursor.lastProcessedHash ?? null }, update: { nextBlock: cursor.nextBlock, lastBlockHash: cursor.lastProcessedHash ?? null } });
   }
-  async putLogIfAbsent(id: string, log: Log) {
+  async putLogIfAbsent(id: string, log: Log, decoded?: DecodedIndexedEvent) {
     if (!log.transactionHash || log.logIndex === null || !log.blockNumber || !log.blockHash) return false;
     try {
-      await this.db.indexedEvent.create({ data: { id: `${id}:${log.transactionHash}:${log.logIndex}`, chainId: this.chainId, transactionHash: log.transactionHash, logIndex: log.logIndex, blockNumber: log.blockNumber, blockHash: log.blockHash, eventName: "unknown", payload: { address: log.address, topics: [...log.topics], data: log.data } } });
+      await this.db.indexedEvent.create({ data: { id: `${id}:${log.transactionHash}:${log.logIndex}`, chainId: this.chainId, transactionHash: log.transactionHash, logIndex: log.logIndex, blockNumber: log.blockNumber, blockHash: log.blockHash, eventName: decoded?.eventName ?? "unrecognized", payload: (decoded?.payload ?? { address: log.address.toLowerCase(), topics: [...log.topics], data: log.data }) as Prisma.InputJsonValue } });
       return true;
     } catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") return false; throw error; }
   }

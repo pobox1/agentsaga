@@ -142,6 +142,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
 
     WorkflowStatus public status;
     bool public finalized;
+    uint16 public activationMask;
     uint16 public completedMask;
     uint16 public failedMask;
     uint16 public skippedMask;
@@ -285,10 +286,6 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         return uint96(uint256(_arg(9)));
     }
 
-    function _maximumNodeBudget() internal view returns (uint96) {
-        return uint96(uint256(_arg(11)));
-    }
-
     function _protocolFeeBps() internal view returns (uint16) {
         return uint16(uint256(_arg(12)));
     }
@@ -370,6 +367,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
 
         available -= node.budget;
         reservedForJobs += node.budget;
+        activationMask |= uint16(uint256(1) << nodeId);
         node.status = NodeStatus.Funded;
         jobAdapter.fund(node.jobId, node.budget);
         _recordTrace("ACTIVATE", nodeId, bytes32(node.jobId));
@@ -411,10 +409,10 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     function onJobRejected(uint256 jobId, bytes32 reason) external onlyAdapter {
         JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
-        _recordEvidence(jobId, bytes32(0), reason);
         if (jobRef.compensation) {
             _failCompensation(jobRef.nodeId, reason);
         } else {
+            _recordEvidence(jobId, bytes32(0), reason);
             _rejectNode(jobRef.nodeId, jobId, reason, NodeStatus.Rejected);
         }
         _assertAccounting();
@@ -424,8 +422,9 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
         if (jobRef.compensation) {
-            _failCompensation(jobRef.nodeId, keccak256("COMPENSATION_EXPIRED"));
+            _markCompensationUnresolved(jobRef.nodeId, keccak256("COMPENSATION_EXPIRED"));
         } else {
+            _recordEvidence(jobId, bytes32(0), keccak256("JOB_EXPIRED"));
             _rejectNode(jobRef.nodeId, jobId, keccak256("JOB_EXPIRED"), NodeStatus.Expired);
         }
         _assertAccounting();
@@ -453,14 +452,10 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         if (_nodes[nodeId].compensationType != CompensationType.RemediationJob) {
             revert CompensationUnavailable();
         }
-        if (compensation.opened || compensation.resolved || compensation.unresolved) {
-            revert CompensationUnavailable();
-        }
+        if (compensation.opened) revert CompensationUnavailable();
         // Recovery policy is snapshotted at workflow creation. Registry changes after funding
         // cannot strand funds reserved for a previously accepted workflow.
-        if (compensation.budget == 0 || compensation.budget > _maximumNodeBudget()) {
-            revert InvalidBudget();
-        }
+        if (compensation.budget == 0) revert InvalidBudget();
         jobId = jobAdapter.createJob(
             provider,
             evaluator,
@@ -476,6 +471,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         compensation.evaluator = evaluator;
         compensation.opened = true;
         _jobReferences[jobId] = JobReference({ nodeId: nodeId, compensation: true, exists: true });
+        _nodes[nodeId].jobId = jobId;
         _nodes[nodeId].status = NodeStatus.Compensating;
         _recordTrace("COMP_OPEN", nodeId, bytes32(jobId));
         emit CompensationJobOpened(nodeId, jobId, provider, compensation.budget);
@@ -485,26 +481,31 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         if (status != WorkflowStatus.Compensating || nodeId >= nodeCount()) revert InvalidState();
         if (nodeId != _highestPendingCompensation()) revert CompensationOrderViolation();
         Compensation storage compensation = _compensations[nodeId];
-        if (compensation.opened || compensation.resolved || compensation.unresolved) {
-            revert CompensationUnavailable();
-        }
+        if (compensation.opened) revert CompensationUnavailable();
         if (evidenceHash == bytes32(0)) revert InvalidNode();
-        compensation.unresolved = true;
-        compensation.evidenceHash = evidenceHash;
-        compensationPendingMask &= ~uint16(uint256(1) << nodeId);
-        compensationUnresolvedMask |= uint16(uint256(1) << nodeId);
-        _nodes[nodeId].status = NodeStatus.Failed;
-        _recordTrace("COMP_UNRESOLVED", nodeId, evidenceHash);
-        emit CompensationUnresolved(nodeId, evidenceHash);
-        if (compensationPendingMask == 0) _finalizeFailedOutcome();
+        _markCompensationUnresolved(nodeId, evidenceHash);
+    }
+
+    /// @notice Permissionlessly closes an expired remediation job and continues reverse-order
+    /// compensation processing without leaving a funded or submitted adapter job dangling.
+    function expireCompensation(uint8 nodeId) external nonReentrant {
+        if (status != WorkflowStatus.Compensating || nodeId >= nodeCount()) revert InvalidState();
+        if (nodeId != _highestPendingCompensation()) revert CompensationOrderViolation();
+        Compensation storage compensation = _compensations[nodeId];
+        if (compensation.opened) {
+            jobAdapter.claimRefund(compensation.jobId);
+        } else {
+            if (block.timestamp < _globalDeadline()) revert InvalidDeadline();
+            _markCompensationUnresolved(nodeId, keccak256("COMPENSATION_EXPIRED"));
+        }
     }
 
     function cancelBeforeExecution() external onlyOwner nonReentrant {
+        if (status > WorkflowStatus.Active) revert InvalidState();
         if (
-            status != WorkflowStatus.Funded && status != WorkflowStatus.Active
-                && status != WorkflowStatus.Draft
+            (activationMask | completedMask | failedMask | skippedMask | compensationPendingMask)
+                    != 0 || reservedForJobs != 0
         ) revert InvalidState();
-        if (completedMask != 0) revert InvalidState();
         if (status == WorkflowStatus.Draft) {
             finalized = true;
             _setStatus(WorkflowStatus.Cancelled);
@@ -518,6 +519,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     function expireWorkflow() external nonReentrant {
         if (block.timestamp < _globalDeadline()) revert InvalidDeadline();
         if (finalized) revert InvalidState();
+        if (status == WorkflowStatus.Compensating) revert InvalidState();
         _closeUnfinishedJobs(NodeStatus.Expired, keccak256("WORKFLOW_EXPIRED"));
         _finalize(WorkflowStatus.Expired);
     }
@@ -682,11 +684,17 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         if (!compensation.opened || compensation.resolved || compensation.unresolved) {
             revert InvalidState();
         }
+        _markCompensationUnresolved(nodeId, evidenceHash);
+    }
+
+    function _markCompensationUnresolved(uint8 nodeId, bytes32 evidenceHash) private {
+        Compensation storage compensation = _compensations[nodeId];
         compensation.unresolved = true;
         compensation.evidenceHash = evidenceHash;
         compensationPendingMask &= ~uint16(uint256(1) << nodeId);
         compensationUnresolvedMask |= uint16(uint256(1) << nodeId);
         _nodes[nodeId].status = NodeStatus.Failed;
+        _recordEvidence(compensation.jobId, bytes32(0), evidenceHash);
         _recordTrace("COMP_FAIL", nodeId, evidenceHash);
         emit CompensationUnresolved(nodeId, evidenceHash);
         if (compensationPendingMask == 0) _finalizeFailedOutcome();
@@ -727,7 +735,9 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
 
     function _finalize(WorkflowStatus finalStatus) private {
         if (finalized) revert InvalidState();
-        if (reservedForJobs != 0) revert AccountingInvariantBroken();
+        if (reservedForJobs != 0 || compensationPendingMask != 0) {
+            revert AccountingInvariantBroken();
+        }
         uint96 refundAmount = available + reservedForCompensation;
         available = 0;
         reservedForCompensation = 0;

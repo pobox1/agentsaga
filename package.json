@@ -8,6 +8,9 @@
   },
   "scripts": {
     "build": "pnpm -r build",
+    "contracts:generate-abi": "pnpm --filter @agentsaga/contracts generate:abi",
+    "contracts:check-abi": "pnpm --filter @agentsaga/contracts check:abi",
+    "deployment:validate": "node scripts/validate-deployment.mjs",
     "dev": "pnpm --filter @agentsaga/web dev",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
