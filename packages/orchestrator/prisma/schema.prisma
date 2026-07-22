@@ -38,12 +38,26 @@ model WorkerAction {
   idempotencyKey String   @unique
   status         String
   attempts       Int      @default(0)
+  executionAttempts Int   @default(0)
+  resumeAttempts Int      @default(0)
+  resumeSequence Int      @default(0)
+  nextAttemptAt DateTime?
+  waitingReason String?
+  lastResult    Json?
+  transactionHash String?
+  transactionNonce Int?
+  signerRole    String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  leaseOwner    String?
+  leaseExpiresAt DateTime?
   lastError      String?
   payload        Json
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   @@index([workflow, status])
+  @@index([status, nextAttemptAt])
 }
 
 model ExecutionRecord {
@@ -59,6 +73,8 @@ model Workflow {
   owner            String
   paymentToken     String?
   status           String
+  statusCode       Int?
+  statusLabel      String?
   totalBudget      String?
   nodeCount        Int?
   createdBlock     BigInt
@@ -71,9 +87,40 @@ model Workflow {
   decisions        EvaluatorDecision[]
   transactions     ChainTransaction[]
   evidence         EvidenceRecord[]
+  jobs             WorkflowJob[]
 
   @@index([chainId, status])
   @@index([owner])
+}
+
+model WorkflowJob {
+  id              String   @id
+  workflowAddress String
+  nodeId          Int
+  jobId           String
+  jobType         String
+  provider        String?
+  evaluator       String?
+  status          String
+  createdBlock    BigInt
+  state           Json
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
+
+  @@unique([workflowAddress, jobId])
+  @@index([workflowAddress, nodeId, jobType])
+}
+
+model ProcessorCapability {
+  processor       String   @id
+  status          String
+  mode            String
+  detail          String?
+  processId       Int?
+  gitCommit       String?
+  heartbeatAt     DateTime?
+  updatedAt       DateTime @updatedAt
 }
 
 model WorkflowNode {

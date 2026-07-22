@@ -50,3 +50,54 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lifecycle-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentsaga
+          POSTGRES_PASSWORD: integration-only
+          POSTGRES_DB: agentsaga
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agentsaga" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://agentsaga:integration-only@127.0.0.1:5432/agentsaga
+      REDIS_URL: redis://127.0.0.1:6379
+      ANVIL_RPC_URL: http://127.0.0.1:8545
+      RUN_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: forge build
+      - run: pnpm --filter @agentsaga/orchestrator exec prisma validate
+      - run: pnpm --filter @agentsaga/orchestrator exec prisma migrate deploy
+      - run: pnpm --filter @agentsaga/orchestrator exec prisma migrate status
+      - run: pnpm --filter @agentsaga/orchestrator exec prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Start and verify Anvil
+        run: |
+          anvil --host 127.0.0.1 --chain-id 5042002 --auto-impersonate > /tmp/agentsaga-anvil.log 2>&1 &
+          for attempt in {1..20}; do
+            if cast chain-id --rpc-url "$ANVIL_RPC_URL"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/agentsaga-anvil.log
+          exit 1
+      - run: pnpm --filter @agentsaga/orchestrator exec vitest run src/runtime.integration.test.ts

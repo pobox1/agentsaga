@@ -50,7 +50,8 @@ export function TransactionCenter() {
       <div><strong>{record.action}</strong><span className={`state state-${record.status.toLowerCase().replaceAll(" ", "-")}`}>{record.status}</span></div>
       <small>{new Date(record.createdAt).toLocaleString()} · Arc Testnet</small>
       <code>{record.hash}</code>
-      <small>From {record.from.slice(0, 10)}… · nonce {record.nonce} · recovery {record.recoveryAttempts}/{maximumAutomaticRecoveryAttempts}</small>
+      <small>From {record.from.slice(0, 10)}… · nonce {record.nonce ?? "pending lookup"} · recovery {record.recoveryAttempts}/{maximumAutomaticRecoveryAttempts}</small>
+      {record.status === "ConfirmedVerificationIncomplete" && <small className="error-text">Confirmed onchain; event verification is incomplete.</small>}
       {record.decodedEvent && <small>Decoded: {record.decodedEvent}</small>}
       {record.expectedEmitter && <small>Expected emitter: {record.expectedEmitter}</small>}
       {record.error && <small className="error-text">{record.error}</small>}

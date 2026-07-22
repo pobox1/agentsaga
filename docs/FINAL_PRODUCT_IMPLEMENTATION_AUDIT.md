@@ -191,3 +191,18 @@ Official configuration sources checked on 2026-07-22:
 4. Provision a persistent orchestrator host with PostgreSQL and Redis, apply migrations, configure secret-manager values and expose `/ready` over HTTPS.
 5. Complete Circle Agent Wallet authentication locally when prompted; do not send an OTP/session token through chat. Approve a real x402 test service/recipient before any payment.
 6. Approve PR merge. After merged `main` exists, configure all seven required Vercel variables, disable production Deployment Protection/SSO and deploy that exact merged commit.
+
+## PR #2 post-review runtime corrections
+
+Starting SHA: `a5f832fbf35a45a31d18b8cf0e706d3dc33e1cc6`.
+
+- Waiting prerequisites persist as `waiting` with reason and due time; they do not consume execution failure attempts or become terminal BullMQ successes.
+- The scheduler process uses PostgreSQL leases, advisory serialization, `FOR UPDATE SKIP LOCKED`, resume sequences, and unique BullMQ attempt IDs. Node approval and signer registration move relevant actions due immediately.
+- Processor registration, heartbeat freshness, and operational capability are independent. Manual, hybrid, and autonomous modes have explicit readiness semantics.
+- Role-separated signers are selected by workflow/node/role and must match fresh onchain addresses before simulation and submission.
+- `WorkflowFunded` cannot overwrite `Active`; canonical status, multi-event transactions, onchain reconciliation, registry receipts, and original/remediation job history are persisted.
+- Browser transaction v3 writes the hash immediately with `nonce: null`, enriches asynchronously, confirms by receipt without nonce, and migrates v1/v2 without silent loss.
+- Confirmed-but-incompletely-verified transactions remain confirmed warnings, while cancellation and expiry visibility use stricter lifecycle guards.
+- Local PostgreSQL 16, Redis 7, and Anvil chain `5042002` integration covers human approval waiting, signer readiness resume, deterministic agent/evaluator execution, three idempotent writes, finalization, concurrent schedulers, and restart recovery.
+
+Deployment remains `not-deployed`; local ephemeral results are not Arc Testnet evidence.

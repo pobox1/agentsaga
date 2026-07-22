@@ -37,12 +37,17 @@ verify source on ArcScan, then run `pnpm --filter @agentsaga/contracts verify:de
 recorded addresses. Do not create the deployment JSON before those values exist onchain.
 # Persistent orchestrator processes
 
-The orchestrator is not a Vercel serverless workload. Deploy the compiled package as three independently restarted processes sharing PostgreSQL, Redis and the same deployment configuration:
+The orchestrator is not a Vercel serverless workload. Deploy the compiled package as four independently restarted processes sharing PostgreSQL, Redis and the same deployment configuration:
 
 ```text
 pnpm --filter @agentsaga/orchestrator start
 pnpm --filter @agentsaga/orchestrator start:worker
 pnpm --filter @agentsaga/orchestrator start:indexer
+pnpm --filter @agentsaga/orchestrator start:scheduler
 ```
 
-Production configuration requires `DATABASE_URL`, `REDIS_URL`, at least one API token, `WORKFLOW_FACTORY_ADDRESS`, `FACTORY_DEPLOYMENT_BLOCK`, and an allowlisted `CORS_ORIGINS`. Run the Prisma migrations before starting any process. `/ready` remains HTTP 503 until Arc RPC, the database, Redis, all processor heartbeats, the factory cursor, and deployment configuration are simultaneously available.
+Production configuration requires `DATABASE_URL`, `REDIS_URL`, at least one API token, `WORKFLOW_FACTORY_ADDRESS`, `FACTORY_DEPLOYMENT_BLOCK`, `OPERATION_MODE`, and an allowlisted `CORS_ORIGINS`. Run every Prisma migration before starting any process.
+
+`/ready` separates `coreReady` from `autonomousReady`. Core readiness requires Arc RPC, PostgreSQL, Redis, applied migrations, queue access, deployment configuration, indexer cursor, and fresh worker/indexer/scheduler heartbeats. Autonomous readiness additionally requires every role signer and agent/evaluator capability. Manual and hybrid modes may serve HTTP 200 for core readiness while returning `autonomousReady: false`; autonomous mode returns HTTP 503 unless both levels are ready.
+
+Configure separate owner/operator, provider, evaluator, compensation-provider, permissionless-expiry, and Circle signer scopes. The runtime verifies the selected address against fresh onchain role data before simulation and submission. Waiting prerequisites are durable PostgreSQL state; the scheduler leases and resumes them without consuming execution failure retries.

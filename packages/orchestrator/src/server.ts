@@ -5,9 +5,11 @@ import { runLocalScenario } from "./demo.js";
 import { loadConfig, type OrchestratorConfig } from "./config.js";
 import { createDemoAgents } from "./agents.js";
 import { prisma, PostgresActionLedger } from "./postgres.js";
-import { QueueRuntime, type QueueName } from "./queues.js";
+import { QueueRuntime, queueNames, type QueueName } from "./queues.js";
 import { createPublicClient, http } from "viem";
 import { arcTestnet } from "@agentsaga/contracts";
+import { loadRuntimeCapabilities } from "./capabilities.js";
+import { buildReadiness, parseHeartbeat } from "./readiness.js";
 
 const localScenarioBody = z.object({ failRisk: z.boolean().optional() }).strict();
 const addressParams = z.object({ address: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
@@ -24,7 +26,22 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
   const apiTokens = new Set([config.ORCHESTRATOR_API_TOKEN, ...(config.ORCHESTRATOR_API_TOKENS?.split(",") ?? [])].filter((token): token is string => Boolean(token?.trim())).map((token) => token.trim()));
   const queueRuntime = config.REDIS_URL ? new QueueRuntime(config.REDIS_URL) : undefined;
   const arcClient = createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
-  app.addHook("onClose", async () => { await queueRuntime?.close(); await prisma.$disconnect(); });
+  const capabilities = loadRuntimeCapabilities(config.OPERATION_MODE, config.RUNTIME_CAPABILITIES_JSON);
+  app.setErrorHandler((error, request, reply) => {
+    request.log.error({ err: error, requestId: request.id }, "request failed");
+    const failure = error instanceof Error ? error : new Error("Unknown request failure");
+    const statusCode = typeof error === "object" && error !== null && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
+    const clientError = statusCode >= 400 && statusCode < 500;
+    return reply.code(clientError ? statusCode : 500).send({ error: clientError && config.NODE_ENV !== "production" ? failure.message : clientError ? "invalid_request" : "internal_server_error" });
+  });
+  app.addHook("onSend", async (_request, reply) => { void reply.header("x-content-type-options", "nosniff").header("x-frame-options", "DENY").header("referrer-policy", "no-referrer").header("permissions-policy", "camera=(), microphone=(), geolocation=()"); });
+  let apiHeartbeat: NodeJS.Timeout | undefined;
+  app.addHook("onReady", async () => {
+    if (!queueRuntime) return;
+    const publish = () => queueRuntime.connection.set("agentsaga:process:api", JSON.stringify({ processId: process.pid, gitCommit: config.GIT_COMMIT_SHA, timestamp: new Date().toISOString(), mode: config.OPERATION_MODE }), "EX", config.HEARTBEAT_STALE_SECONDS * 2);
+    await publish(); apiHeartbeat = setInterval(() => void publish(), 15_000);
+  });
+  app.addHook("onClose", async () => { if (apiHeartbeat) clearInterval(apiHeartbeat); await queueRuntime?.close(); await prisma.$disconnect(); });
   app.addHook("onRequest", async (request, reply) => {
     const origin = request.headers.origin;
     if (origin && !allowedOrigins.has(origin)) return reply.code(403).send({ error: "origin_not_allowed" });
@@ -57,12 +74,15 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
   app.get("/ready", async (_request, reply) => {
     const [database, arcRpc] = await Promise.all([probeDatabase(Boolean(config.DATABASE_URL)), arcClient.getBlockNumber().then(() => "ready" as const).catch(() => "unavailable" as const)]);
     const redis = queueRuntime ? await queueRuntime.connection.ping().then(() => "ready" as const).catch(() => "unavailable" as const) : "not-configured" as const;
-    const processors = queueRuntime && redis === "ready" ? await queueRuntime.processorReadiness() : undefined;
-    const allProcessors = Boolean(processors && Object.values(processors).every(Boolean));
+    const processorHeartbeats = queueRuntime && redis === "ready" ? await queueRuntime.processorHeartbeatDetails(config.HEARTBEAT_STALE_SECONDS) : Object.fromEntries(queueNames.map((name) => [name, { fresh: false }])) as Awaited<ReturnType<QueueRuntime["processorHeartbeatDetails"]>>;
+    const processValues = queueRuntime && redis === "ready" ? await queueRuntime.connection.mget("agentsaga:process:api", "agentsaga:process:worker", "agentsaga:process:indexer", "agentsaga:process:scheduler") : [null, null, null, null];
+    const processes = { api: parseHeartbeat(processValues[0] ?? null, config.HEARTBEAT_STALE_SECONDS), worker: parseHeartbeat(processValues[1] ?? null, config.HEARTBEAT_STALE_SECONDS), indexer: parseHeartbeat(processValues[2] ?? null, config.HEARTBEAT_STALE_SECONDS), scheduler: parseHeartbeat(processValues[3] ?? null, config.HEARTBEAT_STALE_SECONDS) };
     const cursor = config.DATABASE_URL && config.WORKFLOW_FACTORY_ADDRESS ? await prisma.chainCursor.findUnique({ where: { id: `arc:${arcTestnet.id}:factory:${config.WORKFLOW_FACTORY_ADDRESS.toLowerCase()}` } }).then((value) => value ? "ready" as const : "missing" as const).catch(() => "unavailable" as const) : "not-configured" as const;
     const deployment = config.WORKFLOW_FACTORY_ADDRESS && config.FACTORY_DEPLOYMENT_BLOCK !== undefined ? "configured" as const : "not-configured" as const;
-    const ready = arcRpc === "ready" && database === "ready" && redis === "ready" && allProcessors && cursor === "ready" && deployment === "configured";
-    return reply.code(ready ? 200 : 503).send({ status: ready ? "ready" : "not-ready", arcRpc, database, redis, processors, indexerCursor: cursor, deployment, circle: config.CIRCLE_INTEGRATION_STATUS, x402: config.X402_INTEGRATION_STATUS });
+    const migrations = config.DATABASE_URL ? await prisma.$queryRaw<Array<{ migration_name: string }>>`SELECT migration_name FROM "_prisma_migrations" WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1`.then((rows) => rows[0]?.migration_name === "202607220003_durable_waiting_capabilities" ? "ready" as const : "missing" as const).catch(() => "unavailable" as const) : "not-configured" as const;
+    const readiness = buildReadiness({ mode: config.OPERATION_MODE, arcRpc, database, redis, deployment: deployment === "configured" ? "ready" : "not-configured", cursor, migrations, processes, processorHeartbeats, capabilities });
+    const servingReady = config.OPERATION_MODE === "autonomous" ? readiness.coreReady && readiness.autonomousReady : readiness.coreReady;
+    return reply.code(servingReady ? 200 : 503).send({ ...readiness, arcRpc, database, redis, processes, indexerCursor: cursor, migrations, deployment, circle: config.CIRCLE_INTEGRATION_STATUS, x402: config.X402_INTEGRATION_STATUS });
   });
   app.get("/metrics", async (_request, reply) => reply.type("text/plain").send([
     "# HELP agentsaga_up Whether the orchestrator process is up.",

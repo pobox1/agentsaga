@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "start:worker": "node dist/worker-process.js",
     "start:indexer": "node dist/indexer-process.js",
+    "start:scheduler": "node dist/scheduler-process.js",
     "lint": "tsc --noEmit",
     "test": "vitest run --coverage.enabled=false",
     "typecheck": "prisma generate && tsc --noEmit"

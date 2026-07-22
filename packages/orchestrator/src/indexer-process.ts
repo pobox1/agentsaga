@@ -1,12 +1,14 @@
 import { createPublicClient, http, type Address, type Log } from "viem";
-import { arcTestnet, workflowCoordinatorAbi } from "@agentsaga/contracts";
+import { arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowStatusLabels } from "@agentsaga/contracts";
 import { loadConfig } from "./config.js";
-import { ArcEventIndexer, decodeTrackedEvent } from "./indexer.js";
+import { appendTransactionEvent, ArcEventIndexer, decodeTrackedEvent, workflowJobType, workflowStatusUpdate } from "./indexer.js";
 import { PostgresCursorStore, prisma } from "./postgres.js";
 import { Prisma } from "@prisma/client";
+import IORedis from "ioredis";
 
 const config = loadConfig();
-if (!config.DATABASE_URL || !config.WORKFLOW_FACTORY_ADDRESS || config.FACTORY_DEPLOYMENT_BLOCK === undefined) throw new Error("Indexer requires DATABASE_URL, WORKFLOW_FACTORY_ADDRESS and FACTORY_DEPLOYMENT_BLOCK");
+if (!config.DATABASE_URL || !config.REDIS_URL || !config.WORKFLOW_FACTORY_ADDRESS || config.FACTORY_DEPLOYMENT_BLOCK === undefined) throw new Error("Indexer requires DATABASE_URL, REDIS_URL, WORKFLOW_FACTORY_ADDRESS and FACTORY_DEPLOYMENT_BLOCK");
+const redis = new IORedis(config.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: true });
 const factory = config.WORKFLOW_FACTORY_ADDRESS as Address;
 const rpc = createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
 const workflowIndexers = new Map<string, ArcEventIndexer>();
@@ -23,22 +25,50 @@ async function indexWorkflowLog(workflow: string, log: Log): Promise<void> {
   const decoded = decodeTrackedEvent(log); if (!decoded || !log.transactionHash) return;
   const args = decoded.payload.args as Record<string, unknown>;
   const payload = decoded.payload as Prisma.InputJsonValue;
-  await prisma.chainTransaction.upsert({ where: { hash: log.transactionHash }, create: { hash: log.transactionHash, workflowAddress: workflow, chainId: arcTestnet.id, action: decoded.eventName, status: "confirmed", blockNumber: log.blockNumber, toAddress: log.address.toLowerCase(), payload, submittedAt: new Date(), confirmedAt: new Date() }, update: { status: "confirmed", blockNumber: log.blockNumber, confirmedAt: new Date() } });
-  if (decoded.eventName === "WorkflowFunded") await prisma.workflow.update({ where: { address: workflow }, data: { status: "funded" } });
-  if (decoded.eventName === "WorkflowStatusChanged") await prisma.workflow.update({ where: { address: workflow }, data: { status: String(args.current) } });
-  const nodeId = args.nodeId === undefined ? undefined : Number(args.nodeId);
-  if (nodeId !== undefined) await prisma.workflowNode.upsert({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId } }, create: { id: `${workflow}:${nodeId}`, workflowAddress: workflow, nodeId, status: decoded.eventName, jobId: args.jobId === undefined ? null : String(args.jobId), provider: args.provider === undefined ? null : String(args.provider).toLowerCase(), state: payload }, update: { status: decoded.eventName, ...(args.jobId === undefined ? {} : { jobId: String(args.jobId) }), state: payload } });
-  if (nodeId === undefined && args.jobId !== undefined) {
-    const mapped = await prisma.workflowNode.findFirst({ where: { workflowAddress: workflow, jobId: String(args.jobId) } });
-    if (mapped) await prisma.workflowNode.update({ where: { id: mapped.id }, data: { status: decoded.eventName, state: payload } });
+  const transaction = await prisma.chainTransaction.findUnique({ where: { hash: log.transactionHash } });
+  const transactionPayload = appendTransactionEvent(transaction?.payload, { eventName: decoded.eventName, logIndex: log.logIndex, emitter: log.address.toLowerCase() }) as Prisma.InputJsonValue;
+  await prisma.chainTransaction.upsert({ where: { hash: log.transactionHash }, create: { hash: log.transactionHash, workflowAddress: workflow, chainId: arcTestnet.id, action: "multi-event", status: "confirmed", blockNumber: log.blockNumber, toAddress: log.address.toLowerCase(), payload: transactionPayload, submittedAt: new Date(), confirmedAt: new Date() }, update: { action: "multi-event", status: "confirmed", blockNumber: log.blockNumber, confirmedAt: new Date(), payload: transactionPayload } });
+  if (decoded.eventName === "WorkflowFunded") {
+    const current = await prisma.workflow.findUniqueOrThrow({ where: { address: workflow } });
+    await prisma.workflow.update({ where: { address: workflow }, data: { state: { ...(current.state as Record<string, unknown>), deposited: args.amount ?? args.deposited ?? null, fundedAt: new Date().toISOString(), fundingTransaction: log.transactionHash } } });
   }
-  if (decoded.eventName === "WorkflowReceiptFinalized") await prisma.evidenceRecord.upsert({ where: { id: `${workflow}:receipt` }, create: { id: `${workflow}:receipt`, workflowAddress: workflow, kind: "workflow-receipt", commitment: String(args.evidenceAccumulator ?? log.transactionHash), transactionHash: log.transactionHash, metadata: payload }, update: { transactionHash: log.transactionHash, metadata: payload } });
+  const statusUpdate = workflowStatusUpdate(decoded.eventName, args.current);
+  if (statusUpdate) await prisma.workflow.update({ where: { address: workflow }, data: statusUpdate });
+  const nodeId = args.nodeId === undefined ? undefined : Number(args.nodeId);
+  if (nodeId !== undefined) await prisma.workflowNode.upsert({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId } }, create: { id: `${workflow}:${nodeId}`, workflowAddress: workflow, nodeId, status: decoded.eventName, jobId: args.jobId === undefined ? null : String(args.jobId), provider: args.provider === undefined ? null : String(args.provider).toLowerCase(), evaluator: args.evaluator === undefined ? null : String(args.evaluator).toLowerCase(), state: payload }, update: { status: decoded.eventName, ...(args.jobId === undefined ? {} : { jobId: String(args.jobId) }), ...(args.provider === undefined ? {} : { provider: String(args.provider).toLowerCase() }), ...(args.evaluator === undefined ? {} : { evaluator: String(args.evaluator).toLowerCase() }), state: payload } });
+  if (nodeId !== undefined && args.jobId !== undefined) await prisma.workflowJob.upsert({ where: { workflowAddress_jobId: { workflowAddress: workflow, jobId: String(args.jobId) } }, create: { id: `${workflow}:${args.jobId}`, workflowAddress: workflow, nodeId, jobId: String(args.jobId), jobType: workflowJobType(decoded.eventName), provider: args.provider === undefined ? null : String(args.provider).toLowerCase(), evaluator: args.evaluator === undefined ? null : String(args.evaluator).toLowerCase(), status: decoded.eventName, createdBlock: log.blockNumber ?? 0n, state: payload }, update: { status: decoded.eventName, state: payload } });
+  if (nodeId === undefined && args.jobId !== undefined) {
+    const mappedJob = await prisma.workflowJob.findUnique({ where: { workflowAddress_jobId: { workflowAddress: workflow, jobId: String(args.jobId) } } });
+    if (mappedJob) { await prisma.workflowJob.update({ where: { id: mappedJob.id }, data: { status: decoded.eventName, state: payload } }); await prisma.workflowNode.update({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId: mappedJob.nodeId } }, data: { status: decoded.eventName, state: payload } }); }
+  }
+  if (decoded.eventName === "NodeApproved" && nodeId !== undefined) await prisma.workerAction.updateMany({ where: { workflow, nodeId, status: "waiting", waitingReason: "human_approval" }, data: { nextAttemptAt: new Date() } });
+  if (decoded.eventName === "WorkflowReceiptFinalized" && config.RECEIPT_REGISTRY_ADDRESS) {
+    const receipt = await rpc.readContract({ address: config.RECEIPT_REGISTRY_ADDRESS as Address, abi: receiptRegistryAbi, functionName: "getReceipt", args: [workflow as Address] });
+    await prisma.evidenceRecord.upsert({ where: { id: `${workflow}:receipt` }, create: { id: `${workflow}:receipt`, workflowAddress: workflow, kind: "workflow-receipt", commitment: String(args.evidenceAccumulator ?? log.transactionHash), transactionHash: log.transactionHash, metadata: jsonValue(receipt) }, update: { transactionHash: log.transactionHash, metadata: jsonValue(receipt) } });
+  }
+  if (["WorkflowFunded", "WorkflowStatusChanged", "NodeActivated", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationCompleted", "CompensationUnresolved", "Refunded"].includes(decoded.eventName)) await reconcileWorkflow(workflow as Address);
+}
+
+async function reconcileWorkflow(workflow: Address): Promise<void> {
+  const [status, finalized, deposited, completedMask, failedMask, skippedMask, compensationPendingMask, compensatedMask, compensationUnresolvedMask] = await Promise.all([
+    rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "status" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "finalized" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "deposited" }),
+    rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "completedMask" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "failedMask" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "skippedMask" }),
+    rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensatedMask" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationUnresolvedMask" }),
+  ]);
+  const statusCode = Number(status); const statusLabel = workflowStatusLabels[statusCode] ?? `Unknown(${statusCode})`;
+  const current = await prisma.workflow.findUniqueOrThrow({ where: { address: workflow.toLowerCase() } });
+  const reconciled = JSON.parse(JSON.stringify({ finalized, deposited, completedMask, failedMask, skippedMask, compensationPendingMask, compensatedMask, compensationUnresolvedMask }, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Record<string, unknown>;
+  await prisma.workflow.update({ where: { address: workflow.toLowerCase() }, data: { status: statusLabel, statusCode, statusLabel, state: { ...(current.state as Record<string, unknown>), ...reconciled, reconciledAt: new Date().toISOString() } } });
 }
 
 const factoryIndexer = new ArcEventIndexer({ id: `arc:${arcTestnet.id}:factory:${factory.toLowerCase()}`, addresses: [factory], startBlock: config.FACTORY_DEPLOYMENT_BLOCK, rpcUrl: config.ARC_TESTNET_RPC_URL }, new PostgresCursorStore(arcTestnet.id), async (log) => {
   const decoded = decodeTrackedEvent(log); if (decoded?.eventName !== "WorkflowCreated" || !log.blockNumber) return;
   const args = decoded.payload.args as Record<string, unknown>; const workflow = String(args.workflow).toLowerCase() as Address;
-  await prisma.workflow.upsert({ where: { address: workflow }, create: { address: workflow, chainId: arcTestnet.id, owner: String(args.owner).toLowerCase(), status: "created", createdBlock: log.blockNumber, state: { workflowId: String(args.workflowId), specificationHash: String(args.workflowSpecificationHash), creationTransaction: log.transactionHash } }, update: {} });
+  const [owner, paymentToken, totalBudget, nodeCount, jobAdapter, status, specificationHash] = await Promise.all([
+    rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "owner" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "paymentToken" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "totalBudget" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "nodeCount" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "jobAdapter" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "status" }), rpc.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "workflowSpecificationHash" }),
+  ]);
+  const statusCode = Number(status); const statusLabel = workflowStatusLabels[statusCode] ?? `Unknown(${statusCode})`;
+  await prisma.workflow.upsert({ where: { address: workflow }, create: { address: workflow, chainId: arcTestnet.id, owner: owner.toLowerCase(), paymentToken: paymentToken.toLowerCase(), status: statusLabel, statusCode, statusLabel, totalBudget: totalBudget.toString(), nodeCount: Number(nodeCount), createdBlock: log.blockNumber, state: { workflowId: String(args.workflowId), specificationHash: String(specificationHash), factoryAddress: factory.toLowerCase(), jobAdapter: jobAdapter.toLowerCase(), creationTransaction: log.transactionHash, creationBlock: log.blockNumber.toString() } }, update: {} });
   await addWorkflow(workflow, log.blockNumber);
 });
 const receiptIndexer = config.RECEIPT_REGISTRY_ADDRESS ? new ArcEventIndexer({ id: `arc:${arcTestnet.id}:receipts:${config.RECEIPT_REGISTRY_ADDRESS.toLowerCase()}`, addresses: [config.RECEIPT_REGISTRY_ADDRESS as Address], startBlock: config.FACTORY_DEPLOYMENT_BLOCK, rpcUrl: config.ARC_TESTNET_RPC_URL }, new PostgresCursorStore(arcTestnet.id), async (log) => {
@@ -50,6 +80,8 @@ const receiptIndexer = config.RECEIPT_REGISTRY_ADDRESS ? new ArcEventIndexer({ i
 
 for (const row of await prisma.workflow.findMany({ select: { address: true, createdBlock: true } })) await addWorkflow(row.address as Address, row.createdBlock);
 let stopping = false;
-const close = async () => { stopping = true; await prisma.$disconnect(); process.exit(0); };
+const close = async () => { stopping = true; await redis.quit(); await prisma.$disconnect(); process.exit(0); };
 process.once("SIGINT", () => void close()); process.once("SIGTERM", () => void close());
-while (!stopping) { await factoryIndexer.syncOnce(); for (const indexer of workflowIndexers.values()) await indexer.syncOnce(); await receiptIndexer?.syncOnce(); await new Promise((resolve) => setTimeout(resolve, 5_000)); }
+while (!stopping) { await redis.set("agentsaga:process:indexer", JSON.stringify({ processId: process.pid, gitCommit: config.GIT_COMMIT_SHA, timestamp: new Date().toISOString(), mode: config.OPERATION_MODE }), "EX", config.HEARTBEAT_STALE_SECONDS * 2); await factoryIndexer.syncOnce(); for (const indexer of workflowIndexers.values()) await indexer.syncOnce(); await receiptIndexer?.syncOnce(); await new Promise((resolve) => setTimeout(resolve, 5_000)); }
+
+function jsonValue(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Prisma.InputJsonValue; }

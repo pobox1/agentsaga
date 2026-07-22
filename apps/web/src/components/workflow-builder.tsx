@@ -18,7 +18,7 @@ import {
   ARC_TESTNET_USDC,
   workflowFactoryAbi,
 } from "@agentsaga/contracts";
-import { pendingTransactionFromHash, recoverPendingTransaction, trackPendingTransaction } from "../lib/transactions";
+import { pendingTransactionFromHash, recoverPendingTransaction } from "../lib/transactions";
 
 type BuilderNode = {
   name: string;
@@ -179,16 +179,16 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
         action: "create-workflow",
         chainId: arcTestnet.id,
         hash,
+        from: account.address,
         workflow: predictedWorkflow,
         expectedEmitter: factoryAddress,
         expectedEvent: "WorkflowCreated",
         expectedOwner: account.address,
         expectedSpecificationHash,
       });
-      trackPendingTransaction(pending);
       await publicClient.waitForTransactionReceipt({ hash });
       const recovered = await recoverPendingTransaction(publicClient, pending);
-      if (recovered.status !== "ConfirmedEventVerified" && recovered.status !== "ConfirmedStateVerified") throw new Error(recovered.error ?? "Workflow creation could not be verified");
+      if (["Reverted", "Replaced", "Dropped", "RecoveryPaused"].includes(recovered.status)) throw new Error(recovered.error ?? "Workflow creation could not be confirmed");
       const createdWorkflow = recovered.resultingWorkflow ?? predictedWorkflow;
       window.localStorage.setItem(`agentsaga:workflow:${createdWorkflow}`, JSON.stringify({
         workflow: createdWorkflow, transactionHash: hash,

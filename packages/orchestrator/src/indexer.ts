@@ -7,7 +7,7 @@ import {
   type Log,
   type PublicClient,
 } from "viem";
-import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi } from "@agentsaga/contracts";
+import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi, workflowStatusLabels } from "@agentsaga/contracts";
 
 export const trackedEventNames = ["WorkflowCreated", "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated", "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned", "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded", "JobCreated", "JobFunded", "JobSubmitted", "JobCompleted", "JobRejected", "JobExpired", "WorkflowReceiptFinalized"] as const;
 const trackedNames = new Set<string>(trackedEventNames);
@@ -120,3 +120,16 @@ export function decodeTrackedEvent(log: Log): DecodedIndexedEvent | undefined {
 function jsonSafe(value: unknown): Record<string, unknown> {
   return JSON.parse(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Record<string, unknown>;
 }
+
+export function workflowStatusUpdate(eventName: string, current: unknown): { status: string; statusCode: number; statusLabel: string } | undefined {
+  if (eventName !== "WorkflowStatusChanged") return undefined;
+  const statusCode = Number(current); const statusLabel = workflowStatusLabels[statusCode] ?? `Unknown(${statusCode})`;
+  return { status: statusLabel, statusCode, statusLabel };
+}
+
+export function appendTransactionEvent(existing: unknown, event: { eventName: string; logIndex: number | null; emitter: string }) {
+  const events = typeof existing === "object" && existing !== null && "events" in existing && Array.isArray((existing as { events?: unknown }).events) ? (existing as { events: unknown[] }).events : [];
+  return { events: [...events, event] };
+}
+
+export function workflowJobType(eventName: string): "service" | "compensation" { return eventName === "CompensationJobOpened" ? "compensation" : "service"; }

@@ -16,6 +16,22 @@ Vercel: project `agentsaga` is linked. The latest ready deployment is an approxi
 
 Orchestrator: `DATABASE_URL`, `REDIS_URL`, API auth, deployer owner/treasury and deployment RPC variables are not configured in the current environment. No persistent API, worker or indexer service is verified.
 
+## Post-review confirmed blockers
+
+Starting SHA: `a5f832fbf35a45a31d18b8cf0e706d3dc33e1cc6`.
+
+- Worker prerequisites are returned as successful BullMQ results and persisted ambiguously; waiting actions have no durable due-time scheduler, independent resume counter, or concurrency-safe claim lease.
+- Processor registration heartbeats are treated as operational readiness even when required signers, agent adapters, evaluator adapters, or scheduler capability are unavailable.
+- Signer resolution is not yet role-separated or checked against fresh onchain roles before writes.
+- `WorkflowFunded` writes the database lifecycle status back to `funded`, which can overwrite the authoritative later `Active` transition emitted in the same transaction.
+- The indexer models one transaction action and one mutable node `jobId`; it does not preserve multi-event transaction history or original versus compensation jobs.
+- Browser transaction persistence waits for `getTransaction` nonce enrichment after wallet submission, so temporary RPC unavailability can lose the only durable pending record.
+- Confirmed receipts with incomplete event verification can be surfaced as generic failures, and expiry/cancellation visibility needs stricter lifecycle guards.
+- Most registered worker processors still return placeholder outcomes rather than executing or durably waiting for the real lifecycle operation.
+- Existing tests prove registration and isolated behavior but do not yet prove PostgreSQL/Redis/Anvil waiting-resume, restart recovery, lifecycle idempotency, or receipt indexing.
+
+The deployment manifest remains `not-deployed`. No Arc Testnet deployment, transaction, live PostgreSQL/Redis status, Circle wallet activity, x402 payment, or public production availability is claimed.
+
 This audit uses only these classifications:
 
 - **verified and working**
@@ -33,17 +49,17 @@ This audit uses only these classifications:
 | Generated ABI and enum mapping | **verified and working** | Bindings are artifact-generated and checked by CI. |
 | Action-specific event verification | **verified and working** | Version-two records route every action to an explicit verifier with emitter and real event-field checks; successful receipts fall back to fresh state. |
 | Adapter/coordinator job matching | **verified and working** | Frontend confirmations prefer coordinator lifecycle events and persist `expectedJobId`; adapter events remain supplementary index evidence. |
-| Nonce persistence and replacement detection | **verified and working** | Every write resolves the submitted transaction with bounded backoff and requires `from` and `nonce`; replacement requires confirmed nonce advancement. |
+| Provisional transaction persistence | **verified and working** | Version-three records persist hash and sender immediately with nullable nonce; bounded asynchronous enrichment cannot delete the record, receipt recovery works first, and replacement checks require a known nonce. |
 | Bounded recovery | **verified and working** | Exponential eligibility, eight automatic attempts, pause, manual retry, dismiss, and terminal incomplete-confirmation states prevent endless polling. |
 | Transaction recovery tests | **verified and working** | Vitest covers all action dispatch paths plus emitter, ownerless event, node/job, state fallback, revert, replacement, temporary unavailability, retry limit, dismiss, nonce and migration. |
 | Role-aware frontend actions | **implemented but local only** | Fresh wallet, chain, node, role, expiry, activation and compensation-order reads run before simulation; no deployed contracts exist for browser verification. |
 | Builder completeness | **implemented but local only** | Builder captures optional agent IDs as metadata, per-node expiry/URI/compensation spec, explicit review, predicted address, gas estimate and exact USDC envelope. |
-| BullMQ queue declarations | **implemented but local only** | All fifteen queues register processors in a separate worker process and publish Redis readiness heartbeats; no live Redis is configured. |
-| Worker runtime | **implemented but disconnected** | Separate process, persistent action states, DLQ, explicit blocked outcomes and least-privilege signer interface exist; role signers and external agent adapters are not configured. |
-| Indexer process | **implemented but disconnected** | Separate persistent process indexes the factory, creates per-workflow coordinator/adapter cursors, maps job IDs and persists receipts; no deployment start block/database is configured. |
+| BullMQ and durable scheduler | **verified and working locally** | Fifteen processors plus a PostgreSQL-backed scheduler use stable logical keys, unique execution-attempt IDs, leases, independent counters, and PostgreSQL/Redis integration tests. Production Redis remains unconfigured. |
+| Worker runtime | **implemented but disconnected** | Deterministic agent/evaluator plus activate, submit, complete/reject, expiry, reconciliation and receipt paths use fresh RPC state and role-separated signer resolution. Production signers/external adapters are not configured. |
+| Indexer process | **implemented but disconnected** | `WorkflowStatusChanged` is authoritative; `WorkflowFunded` updates financial state only, reconciliation refreshes masks, and multi-event plus original/remediation job history is preserved. No deployed start block exists. |
 | PostgreSQL repositories | **implemented but disconnected** | Prisma models/migrations exist; no live database or applied production migration is verified. |
 | Redis and queues | **implemented but disconnected** | BullMQ runtime exists; no live Redis or processor registry is verified. |
-| Production readiness endpoint | **implemented but disconnected** | `/ready` now requires Arc RPC, PostgreSQL, Redis, every processor heartbeat, indexer cursor and deployment configuration; live infrastructure is absent. |
+| Production readiness endpoint | **verified and working locally** | `/ready` separates core/autonomous readiness, checks migrations and fresh worker/indexer/scheduler plus processor heartbeats, and cannot call missing signers/adapters autonomous. Live production infrastructure is absent. |
 | Public orchestrator APIs | **implemented but local only** | Workflow, node, event, execution, transaction, receipt, agent, queue and authenticated DLQ/retry routes are implemented and typechecked. |
 | Arc Testnet contracts | **blocked by operator action** | Secure funded signer, owner and treasury choices are absent; manifest remains truthful. |
 | Successful and failed workflows | **blocked by operator action** | Require deployed contracts and funded role wallets. |

@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { formatUnits, getAddress, isAddress, keccak256, stringToHex, type Address, type ContractFunctionReturnType, type Hash } from "viem";
 import { useAccount, usePublicClient, useReadContract, useReadContracts, useSwitchChain, useWalletClient } from "wagmi";
 import { agentJobAdapterAbi, arcTestnet, erc20Abi, nodeStatusLabels, workflowCoordinatorAbi } from "@agentsaga/contracts";
-import { isTerminalTransactionStatus, pendingTransactionFromHash, recoverPendingTransaction, trackPendingTransaction, type PendingTransaction, type TransactionAction } from "../lib/transactions";
+import { isTerminalTransactionStatus, pendingTransactionFromHash, recoverPendingTransaction, type PendingTransaction, type TransactionAction } from "../lib/transactions";
+import { canCancelWorkflow, canExpireWorkflow, coordinatorImmutableUint } from "../lib/workflow-controls";
 
 type Dialog =
   | { kind: "commitment"; key: string; functionName: "submit" | "complete" | "reject"; jobId: bigint; nodeId: number; compensation: boolean; provider: Address; evaluator: Address; budget: bigint }
@@ -19,9 +20,10 @@ const subscribeClock = (callback: () => void) => {
   return () => window.clearInterval(timer);
 };
 const nowSeconds = () => Math.floor(Date.now() / 1_000);
+const useNowSeconds = () => useSyncExternalStore(subscribeClock, nowSeconds, () => 0);
 
-export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, totalBudget, deposited }: {
-  workflow: Address; owner: Address | undefined; token: Address | undefined; adapter: Address | undefined; nodeCount: number; totalBudget: bigint; deposited: bigint;
+export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, totalBudget, deposited, status, finalized, activationMask, reservedForJobs }: {
+  workflow: Address; owner: Address | undefined; token: Address | undefined; adapter: Address | undefined; nodeCount: number; totalBudget: bigint; deposited: bigint; status: number; finalized: boolean; activationMask: number; reservedForJobs: bigint;
 }) {
   const account = useAccount();
   const publicClient = usePublicClient({ chainId: arcTestnet.id });
@@ -30,9 +32,12 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
   const [busy, setBusy] = useState<string>();
   const [message, setMessage] = useState<string>();
   const [dialog, setDialog] = useState<Dialog>();
+  const [globalDeadline, setGlobalDeadline] = useState<bigint>();
+  const now = useNowSeconds();
   const nodes = useReadContracts({ contracts: Array.from({ length: nodeCount }, (_, nodeId) => ({ address: workflow, abi: workflowCoordinatorAbi, functionName: "getNode" as const, args: [nodeId] })) });
   const pendingCompensation = useReadContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" });
   const allowance = useReadContract({ address: token, abi: erc20Abi, functionName: "allowance", args: account.address && token ? [account.address, workflow] : undefined, query: { enabled: Boolean(account.address && token) } });
+  useEffect(() => { let cancelled = false; if (publicClient) void publicClient.getBytecode({ address: workflow }).then((bytecode) => { if (!cancelled) setGlobalDeadline(coordinatorImmutableUint(bytecode, 6)); }).catch(() => { if (!cancelled) setGlobalDeadline(undefined); }); return () => { cancelled = true; }; }, [publicClient, workflow]);
 
   async function transact(key: string, request: Parameters<NonNullable<typeof publicClient>["simulateContract"]>[0], details: { action: TransactionAction; expectedEvent: string } & Partial<Pick<PendingTransaction, "nodeId" | "expectedJobId" | "expectedOwner" | "expectedApprover" | "expectedProvider" | "expectedEvaluator" | "expectedSpender" | "expectedAmount" | "expectedFinalStatus" | "expectedDeliverableHash">>) {
     if (!account.address || !publicClient || !walletClient.data) throw new Error("Connect a wallet first");
@@ -65,13 +70,12 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
       }
       const simulation = await publicClient.simulateContract({ ...request, account: account.address });
       const hash = await walletClient.data.writeContract(simulation.request);
-      const pending = await pendingTransactionFromHash(publicClient, { ...details, chainId: arcTestnet.id, hash, workflow, expectedEmitter: details.action === "approve-usdc" ? token! : workflow });
-      trackPendingTransaction(pending);
+      const pending = await pendingTransactionFromHash(publicClient, { ...details, chainId: arcTestnet.id, hash, from: account.address, workflow, expectedEmitter: details.action === "approve-usdc" ? token! : workflow });
       setMessage(`Submitted ${hash.slice(0, 10)}…`);
       await publicClient.waitForTransactionReceipt({ hash });
       const recovered = await recoverPendingTransaction(publicClient, pending);
-      if (!isTerminalTransactionStatus(recovered.status) || recovered.status === "Reverted" || recovered.status === "Replaced" || recovered.status === "Dropped" || recovered.status === "ConfirmedVerificationIncomplete") throw new Error(recovered.error ?? recovered.status);
-      setMessage(`Confirmed ${hash.slice(0, 10)}…`);
+      if (!isTerminalTransactionStatus(recovered.status) || recovered.status === "Reverted" || recovered.status === "Replaced" || recovered.status === "Dropped") throw new Error(recovered.error ?? recovered.status);
+      setMessage(recovered.status === "ConfirmedVerificationIncomplete" ? `Confirmed ${hash.slice(0, 10)}…; verification warning: ${recovered.error ?? "event details incomplete"}` : `Confirmed ${hash.slice(0, 10)}…`);
       await Promise.all([nodes.refetch(), allowance.refetch(), pendingCompensation.refetch()]);
     } finally { setBusy(undefined); }
   }
@@ -123,11 +127,13 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
   const isOwner = account.address?.toLowerCase() === owner?.toLowerCase();
   const pendingMask = Number(pendingCompensation.data ?? 0);
   const highestPending = pendingMask === 0 ? -1 : 31 - Math.clz32(pendingMask);
+  const showCancel = canCancelWorkflow({ isOwner: Boolean(isOwner), activationMask, reservedForJobs, finalized, status });
+  const showExpire = canExpireWorkflow({ now, ...(globalDeadline === undefined ? {} : { globalDeadline }), finalized, status, compensationPendingMask: pendingMask });
   return <div className="panel">
     <div className="panel-heading"><div><p className="eyebrow">Role-aware operations</p><h2>Nodes and transactions</h2></div></div>
     {deposited === 0n && isOwner && <button className="button button-primary" disabled={Boolean(busy)} onClick={approveAndFund}>{busy === "approve" ? "Approving exact budget…" : busy === "fund" ? "Funding…" : `Approve & fund ${formatUnits(totalBudget, 6)} USDC`}</button>}
     <div className="node-stack">{nodes.data?.map((result, nodeId) => result.status === "success" ? <NodeCard key={nodeId} nodeId={nodeId} node={result.result} account={account.address} owner={isOwner} adapter={adapter} busy={Boolean(busy)} compensationPending={nodeId === highestPending} setDialog={setDialog} coordinatorAction={coordinatorAction} claimExpiry={claimExpiry} /> : <div className="node-editor" key={nodeId}>Node {nodeId + 1}: RPC read failed</div>)}</div>
-    <div className="action-row">{isOwner && <button type="button" disabled={Boolean(busy)} onClick={() => coordinatorAction("cancel", "cancelBeforeExecution")}>Cancel before execution</button>}<button type="button" disabled={Boolean(busy)} onClick={() => coordinatorAction("expire", "expireWorkflow")}>Expire workflow</button></div>
+    <div className="action-row">{showCancel && <button type="button" disabled={Boolean(busy)} onClick={() => coordinatorAction("cancel", "cancelBeforeExecution")}>Cancel before execution</button>}{showExpire && <button type="button" disabled={Boolean(busy)} onClick={() => coordinatorAction("expire", "expireWorkflow")}>Expire workflow</button>}</div>
     {message && <p className="form-message">{message}</p>}
     {dialog && <ActionDialog dialog={dialog} close={() => setDialog(undefined)} submit={async (value) => {
       try {
@@ -145,7 +151,7 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
 
 type NodeValue = ContractFunctionReturnType<typeof workflowCoordinatorAbi, "view", "getNode">;
 function NodeCard({ nodeId, node, account, owner, adapter, busy, compensationPending, setDialog, coordinatorAction, claimExpiry }: { nodeId: number; node: NodeValue; account?: Address | undefined; owner: boolean; adapter?: Address | undefined; busy: boolean; compensationPending: boolean; setDialog: (dialog: Dialog) => void; coordinatorAction: (key: string, fn: "activateNode" | "approveNode" | "expireCompensation" | "openNextCompensation", args: readonly unknown[]) => Promise<void>; claimExpiry: (jobId: bigint, nodeId: number) => Promise<void> }) {
-  const now = useSyncExternalStore(subscribeClock, nowSeconds, () => 0);
+  const now = useNowSeconds();
   const compensationJob = useReadContract({ address: adapter, abi: agentJobAdapterAbi, functionName: "getJob", args: [node.jobId], query: { enabled: Boolean(adapter && node.status === 9) } });
   const provider = node.status === 9 && compensationJob.data ? compensationJob.data.provider : node.provider;
   const evaluator = node.status === 9 && compensationJob.data ? compensationJob.data.evaluator : node.evaluator;
@@ -153,7 +159,8 @@ function NodeCard({ nodeId, node, account, owner, adapter, busy, compensationPen
   const effectiveBudget = node.status === 9 && compensationJob.data ? compensationJob.data.budget : node.budget;
   const isProvider = account?.toLowerCase() === provider.toLowerCase();
   const isEvaluator = account?.toLowerCase() === evaluator.toLowerCase();
-  return <div className="node-editor"><strong>Node {nodeId + 1} · {nodeStatusLabels[node.status] ?? `Unknown (${node.status})`}</strong>
+  const nodeLabel = nodeStatusLabels[node.status] ?? `Unknown (${node.status})`;
+  return <div className="node-editor"><strong>Node {nodeId + 1} · {nodeLabel === "Rejected" && now >= Number(node.expiry) ? "Expired" : nodeLabel}</strong>
     <dl className="summary-list"><div><dt>Provider</dt><dd><code>{provider}</code></dd></div><div><dt>Evaluator</dt><dd><code>{evaluator}</code></dd></div><div><dt>Budget</dt><dd>{formatUnits(node.budget, 6)} USDC</dd></div><div><dt>Job</dt><dd>{node.jobId.toString()}</dd></div><div><dt>Expiry</dt><dd>{new Date(Number(node.expiry) * 1000).toISOString()}</dd></div></dl>
     <div className="action-row">
       {node.status === 1 && <button type="button" disabled={busy} onClick={() => coordinatorAction(`activate-${nodeId}`, "activateNode", [nodeId])}>Activate</button>}
