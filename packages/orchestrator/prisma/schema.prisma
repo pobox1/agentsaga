@@ -1,10 +1,10 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model ChainCursor {
@@ -46,3 +46,136 @@ model WorkerAction {
   @@index([workflow, status])
 }
 
+model ExecutionRecord {
+  id        String   @id
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Workflow {
+  address          String   @id
+  chainId          Int
+  owner            String
+  paymentToken     String?
+  status           String
+  totalBudget      String?
+  nodeCount        Int?
+  createdBlock     BigInt
+  finalizedBlock   BigInt?
+  state            Json
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  nodes            WorkflowNode[]
+  executions       AgentExecution[]
+  decisions        EvaluatorDecision[]
+  transactions     ChainTransaction[]
+  evidence         EvidenceRecord[]
+
+  @@index([chainId, status])
+  @@index([owner])
+}
+
+model WorkflowNode {
+  id              String   @id
+  workflowAddress String
+  nodeId          Int
+  status          String
+  provider        String?
+  evaluator       String?
+  jobId           String?
+  state           Json
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
+
+  @@unique([workflowAddress, nodeId])
+  @@index([workflowAddress, status])
+}
+
+model AgentExecution {
+  id              String   @id
+  workflowAddress String
+  nodeId          Int
+  agentId         String
+  status          String
+  input           Json
+  output          Json?
+  evidenceHash    String?
+  cost            String?
+  error            String?
+  startedAt       DateTime
+  completedAt     DateTime?
+  workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
+
+  @@index([workflowAddress, nodeId])
+}
+
+model EvaluatorDecision {
+  id              String   @id
+  workflowAddress String
+  nodeId          Int
+  evaluatorId     String
+  decision        String
+  reasonCode      String
+  evidenceHash    String
+  evaluatedAt     DateTime
+  workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
+
+  @@index([workflowAddress, nodeId])
+}
+
+model ChainTransaction {
+  hash            String   @id
+  workflowAddress String?
+  chainId         Int
+  action          String
+  status          String
+  blockNumber     BigInt?
+  fromAddress     String?
+  toAddress       String?
+  payload         Json
+  submittedAt     DateTime
+  confirmedAt     DateTime?
+  workflow        Workflow? @relation(fields: [workflowAddress], references: [address], onDelete: SetNull)
+
+  @@index([workflowAddress, action])
+}
+
+model IdempotencyRecord {
+  key         String   @id
+  operation   String
+  status      String
+  result      Json?
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model DeadLetterRecord {
+  id             String   @id
+  queue          String
+  originalJobId  String?
+  payload        Json
+  error          String
+  attempts       Int
+  resolvedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([queue, resolvedAt])
+}
+
+model EvidenceRecord {
+  id              String   @id
+  workflowAddress String
+  nodeId          Int?
+  kind            String
+  commitment      String
+  uri             String?
+  transactionHash String?
+  metadata        Json
+  createdAt       DateTime @default(now())
+  workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
+
+  @@index([workflowAddress, nodeId])
+}

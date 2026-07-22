@@ -6,7 +6,7 @@ out = "out"
 libs = ["lib"]
 solc_version = "0.8.30"
 optimizer = true
-optimizer_runs = 10000
+optimizer_runs = 1
 via_ir = true
 fuzz = { runs = 512 }
 invariant = { runs = 256, depth = 64, fail_on_revert = false }
@@ -20,4 +20,3 @@ quote_style = "double"
 
 [rpc_endpoints]
 arc_testnet = "${ARC_TESTNET_RPC_URL}"
-

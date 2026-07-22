@@ -3,6 +3,8 @@ pragma solidity 0.8.30;
 
 import { Test } from "forge-std/Test.sol";
 import { MockUSDC } from "./mocks/MockUSDC.sol";
+import { FeeOnTransferUSDC } from "./mocks/FeeOnTransferUSDC.sol";
+import { ReentrantUSDC } from "./mocks/ReentrantUSDC.sol";
 import { PolicyRegistry } from "../src/PolicyRegistry.sol";
 import { WorkflowFactory } from "../src/WorkflowFactory.sol";
 import { WorkflowCoordinator } from "../src/WorkflowCoordinator.sol";
@@ -46,7 +48,6 @@ contract WorkflowCoordinatorTest is Test {
         assertEq(workflow.failedMask(), 0);
         assertEq(workflow.paidToProviders(), EXECUTION_BUDGET);
         assertEq(workflow.refunded(), COMPENSATION_RESERVE);
-        assertTrue(workflow.accountingInvariantHolds());
 
         WorkflowReceiptRegistry.Receipt memory receipt = receipts.getReceipt(address(workflow));
         assertEq(receipt.workflow, address(workflow));
@@ -54,7 +55,15 @@ contract WorkflowCoordinatorTest is Test {
         assertEq(receipt.providersPaid, EXECUTION_BUDGET);
         assertEq(receipt.refunded, COMPENSATION_RESERVE);
         assertEq(receipt.completedMask, 0x1f);
-        assertTrue(receipt.finalEvidenceRoot != bytes32(0));
+        assertEq(receipt.paymentToken, address(usdc));
+        assertEq(receipt.nodeCount, 5);
+        assertEq(receipt.skippedMask, 0);
+        assertEq(receipt.compensationUnresolvedMask, 0);
+        assertEq(receipt.dagSpecificationHash, DAG_HASH);
+        assertEq(receipt.policyVersion, 1);
+        assertGt(receipt.globalDeadline, block.timestamp);
+        assertEq(receipt.configuredCompensationReserve, COMPENSATION_RESERVE);
+        assertTrue(receipt.evidenceAccumulator != bytes32(0));
         assertTrue(receipt.executionTraceHash != bytes32(0));
     }
 
@@ -94,7 +103,6 @@ contract WorkflowCoordinatorTest is Test {
         assertEq(workflow.compensationSpent(), 50e6);
         assertEq(workflow.paidToProviders(), 200e6);
         assertEq(workflow.refunded(), 350e6);
-        assertTrue(workflow.accountingInvariantHolds());
 
         WorkflowReceiptRegistry.Receipt memory receipt = receipts.getReceipt(address(workflow));
         assertEq(receipt.failedMask, 0x04);
@@ -173,6 +181,173 @@ contract WorkflowCoordinatorTest is Test {
         workflow.activateNode(0);
     }
 
+    function testPauseBlocksCreationButAllowsSubmittedCompletion() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        WorkflowCoordinator workflow = _create(nodes, NODE_BUDGET, 0);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(node.provider);
+        adapter.submit(node.jobId, keccak256("submitted-before-pause"));
+
+        policy.setPaused(true);
+        vm.prank(node.evaluator);
+        adapter.complete(node.jobId, keccak256("valid-during-pause"));
+        assertTrue(workflow.finalized());
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Completed));
+
+        vm.expectRevert(WorkflowFactory.EmergencyPaused.selector);
+        _create(nodes, NODE_BUDGET, 0);
+    }
+
+    function testRefundAndExpiryRemainAvailableDuringPause() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        WorkflowCoordinator workflow = _create(nodes, NODE_BUDGET, 0);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        policy.setPaused(true);
+        vm.warp(node.expiry);
+        workflow.jobAdapter().claimRefund(node.jobId);
+        assertTrue(workflow.finalized());
+        assertEq(workflow.refunded(), NODE_BUDGET);
+    }
+
+    function testPolicyChangesAfterFundingCannotBlockReservedCompensation() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+        _activateSubmitComplete(workflow, 0);
+        _activateSubmitComplete(workflow, 1);
+        _rejectRiskNode(workflow);
+
+        PolicyRegistry.Limits memory limits = policy.limits();
+        limits.maximumNodeBudget = 1e6;
+        policy.setLimits(limits);
+        policy.setAllowlistEnforcement(true, true);
+        policy.setPaused(true);
+
+        _openAndCompleteCompensation(workflow, 1, keccak256("snapshot-policy-1"));
+        _openAndCompleteCompensation(workflow, 0, keccak256("snapshot-policy-0"));
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensatedMask(), 0x03);
+    }
+
+    function testManualRecoveryNeverOpensAutonomousJob() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = _linearNodes(false);
+        nodes[0].compensationType = WorkflowCoordinator.CompensationType.ManualRecovery;
+        nodes[0].compensationSpecificationHash = keccak256("manual-recovery-runbook");
+        WorkflowCoordinator workflow = _create(nodes, EXECUTION_BUDGET, COMPENSATION_RESERVE);
+        _fund(workflow);
+        _activateSubmitComplete(workflow, 0);
+        _activateSubmitComplete(workflow, 1);
+        _rejectRiskNode(workflow);
+
+        vm.expectRevert(WorkflowCoordinator.CompensationUnavailable.selector);
+        workflow.openNextCompensation(
+            0, compensationProvider, compensationEvaluator, uint48(block.timestamp + 1 days)
+        );
+        workflow.declareCompensationUnresolved(0, keccak256("OPERATOR_ACTION_REQUIRED"));
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensationUnresolvedMask(), 0x01);
+        assertEq(workflow.compensationSpent(), 0);
+    }
+
+    function testMetadataBounds() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        nodes[0].metadataURI = string(new bytes(2_049));
+        vm.expectRevert(WorkflowCoordinator.MetadataTooLong.selector);
+        _create(nodes, NODE_BUDGET, 0);
+
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        vm.expectRevert(WorkflowCoordinator.MetadataTooLong.selector);
+        factory.createWorkflow(
+            address(usdc),
+            NODE_BUDGET,
+            0,
+            uint48(block.timestamp + 5 days),
+            DAG_HASH,
+            string(new bytes(2_049)),
+            keccak256("metadata-bound"),
+            nodes
+        );
+    }
+
+    function testMaximumSixteenNodeGraphAndAddressPrediction() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](16);
+        for (uint8 i; i < 16; ++i) {
+            nodes[i] = _node(i, 1e6, 0, false, i == 0 ? 0 : uint16(1 << (i - 1)));
+        }
+        bytes32 userSalt = keccak256("predict-16");
+        uint48 deadline = uint48(block.timestamp + 5 days);
+        address predicted = factory.predictWorkflowAddress(
+            address(this),
+            0,
+            address(usdc),
+            16e6,
+            0,
+            deadline,
+            DAG_HASH,
+            "ipfs://sixteen",
+            userSalt,
+            nodes
+        );
+        (, WorkflowCoordinator workflow) = factory.createWorkflow(
+            address(usdc), 16e6, 0, deadline, DAG_HASH, "ipfs://sixteen", userSalt, nodes
+        );
+        assertEq(address(workflow), predicted);
+        assertEq(workflow.nodeCount(), 16);
+    }
+
+    function testFeeOnTransferTokenIsRejected() public {
+        FeeOnTransferUSDC feeToken = new FeeOnTransferUSDC();
+        PolicyRegistry feePolicy = new PolicyRegistry(address(this), treasury, address(feeToken));
+        WorkflowFactory feeFactory = new WorkflowFactory(feePolicy);
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        (, WorkflowCoordinator workflow) = feeFactory.createWorkflow(
+            address(feeToken),
+            NODE_BUDGET,
+            0,
+            uint48(block.timestamp + 5 days),
+            DAG_HASH,
+            "ipfs://fee-token",
+            keccak256("fee-token"),
+            nodes
+        );
+        feeToken.mint(address(this), NODE_BUDGET);
+        feeToken.approve(address(workflow), NODE_BUDGET);
+        vm.expectRevert(WorkflowCoordinator.FeeOnTransferUnsupported.selector);
+        workflow.fund();
+    }
+
+    function testReentrantFundingCallbackIsRejectedWithoutBreakingDeposit() public {
+        ReentrantUSDC token = new ReentrantUSDC();
+        policy.setPaymentToken(address(token), true);
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, NODE_BUDGET, 0, false, 0);
+        (, WorkflowCoordinator workflow) = factory.createWorkflow(
+            address(token),
+            NODE_BUDGET,
+            0,
+            uint48(block.timestamp + 5 days),
+            DAG_HASH,
+            "ipfs://reentrancy-test",
+            keccak256("reentrancy"),
+            nodes
+        );
+        token.mint(address(this), NODE_BUDGET);
+        token.approve(address(workflow), NODE_BUDGET);
+        token.setTarget(address(workflow));
+        workflow.fund();
+        assertTrue(token.attempted());
+        assertFalse(token.callbackSucceeded());
+        assertEq(workflow.deposited(), NODE_BUDGET);
+    }
+
     function testUnauthorizedProviderAndEvaluatorRejected() public {
         WorkflowCoordinator workflow = _createLinearWorkflow(false);
         _fund(workflow);
@@ -218,20 +393,187 @@ contract WorkflowCoordinatorTest is Test {
         assertEq(workflow.refunded(), 400e6);
     }
 
+    function testCancelBeforeFunding() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        workflow.cancelBeforeExecution();
+        assertTrue(workflow.finalized());
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Cancelled));
+        assertEq(workflow.deposited(), 0);
+        assertEq(workflow.refunded(), 0);
+    }
+
+    function testCancelAfterFundingBeforeActivationHasExactAccounting() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        uint256 ownerBalanceBefore = usdc.balanceOf(address(this));
+        workflow.cancelBeforeExecution();
+
+        assertTrue(workflow.finalized());
+        assertEq(workflow.activationMask(), 0);
+        assertEq(workflow.refunded(), workflow.totalBudget());
+        assertEq(usdc.balanceOf(address(this)) - ownerBalanceBefore, workflow.totalBudget());
+        assertEq(usdc.balanceOf(address(workflow)), 0);
+        assertEq(workflow.reservedForJobs(), 0);
+        assertEq(workflow.reservedForCompensation(), 0);
+    }
+
+    function testCancelAfterFirstActivationReverts() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        workflow.activateNode(0);
+        assertEq(workflow.activationMask(), 0x01);
+        vm.expectRevert(WorkflowCoordinator.InvalidState.selector);
+        workflow.cancelBeforeExecution();
+    }
+
+    function testCancelAfterProviderSubmissionReverts() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(node.provider);
+        adapter.submit(node.jobId, keccak256("submitted-work"));
+        vm.expectRevert(WorkflowCoordinator.InvalidState.selector);
+        workflow.cancelBeforeExecution();
+    }
+
+    function testCancelAfterRejectionReverts() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(node.evaluator);
+        adapter.reject(node.jobId, keccak256("rejected-before-submit"));
+        vm.expectRevert(WorkflowCoordinator.InvalidState.selector);
+        workflow.cancelBeforeExecution();
+    }
+
+    function testCancelDuringCompensationReverts() public {
+        WorkflowCoordinator workflow = _prepareCompensatingWorkflow();
+        vm.expectRevert(WorkflowCoordinator.InvalidState.selector);
+        workflow.cancelBeforeExecution();
+    }
+
+    function testFundedCompensationExpiryClosesAdapterJob() public {
+        WorkflowCoordinator workflow = _prepareCompensatingWorkflow();
+        uint48 deadline = uint48(block.timestamp + 1 days);
+        uint256 jobId = workflow.openNextCompensation(
+            1, compensationProvider, compensationEvaluator, deadline
+        );
+        vm.warp(deadline);
+        vm.expectEmit(true, false, false, true, address(workflow));
+        emit WorkflowCoordinator.CompensationUnresolved(1, keccak256("COMPENSATION_EXPIRED"));
+        workflow.expireCompensation(1);
+
+        AgentJobAdapter.Job memory job = workflow.jobAdapter().getJob(jobId);
+        assertEq(uint8(job.status), uint8(AgentJobAdapter.JobStatus.Expired));
+        assertEq(workflow.compensationPendingMask(), 0x01);
+        assertEq(workflow.compensationUnresolvedMask(), 0x02);
+        vm.expectRevert(WorkflowCoordinator.CompensationOrderViolation.selector);
+        workflow.expireCompensation(1);
+    }
+
+    function testSubmittedCompensationExpiryClosesAdapterJob() public {
+        WorkflowCoordinator workflow = _prepareCompensatingWorkflow();
+        uint48 deadline = uint48(block.timestamp + 1 days);
+        uint256 jobId = workflow.openNextCompensation(
+            1, compensationProvider, compensationEvaluator, deadline
+        );
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(compensationProvider);
+        adapter.submit(jobId, keccak256("partial-remediation"));
+        vm.warp(deadline);
+        workflow.expireCompensation(1);
+
+        AgentJobAdapter.Job memory job = workflow.jobAdapter().getJob(jobId);
+        assertEq(uint8(job.status), uint8(AgentJobAdapter.JobStatus.Expired));
+        assertEq(workflow.compensationUnresolvedMask(), 0x02);
+    }
+
+    function testMultipleCompensationJobsExpireInReverseOrderWithExactAccounting() public {
+        WorkflowCoordinator workflow = _prepareCompensatingWorkflow();
+        uint48 firstDeadline = uint48(block.timestamp + 1 days);
+        uint256 firstJob = workflow.openNextCompensation(
+            1, compensationProvider, compensationEvaluator, firstDeadline
+        );
+        vm.warp(firstDeadline);
+        workflow.expireCompensation(1);
+
+        uint48 secondDeadline = firstDeadline + 1 days;
+        uint256 secondJob = workflow.openNextCompensation(
+            0, compensationProvider, compensationEvaluator, secondDeadline
+        );
+        vm.warp(secondDeadline);
+        workflow.expireCompensation(0);
+
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensationPendingMask(), 0);
+        assertEq(workflow.compensationUnresolvedMask(), 0x03);
+        assertEq(workflow.compensationSpent(), 0);
+        assertEq(workflow.paidToProviders(), 200e6);
+        assertEq(workflow.refunded(), 400e6);
+        assertEq(usdc.balanceOf(address(workflow)), 0);
+        assertEq(
+            uint8(workflow.jobAdapter().getJob(firstJob).status),
+            uint8(AgentJobAdapter.JobStatus.Expired)
+        );
+        assertEq(
+            uint8(workflow.jobAdapter().getJob(secondJob).status),
+            uint8(AgentJobAdapter.JobStatus.Expired)
+        );
+    }
+
+    function testWorkflowExpiryWaitsForLaterCompensationDeadline() public {
+        WorkflowCoordinator workflow = _prepareCompensatingWorkflow();
+        uint48 compensationDeadline = uint48(block.timestamp + 6 days);
+        uint256 jobId = workflow.openNextCompensation(
+            1, compensationProvider, compensationEvaluator, compensationDeadline
+        );
+
+        vm.warp(block.timestamp + 5 days);
+        vm.expectRevert(WorkflowCoordinator.InvalidState.selector);
+        workflow.expireWorkflow();
+        assertEq(
+            uint8(workflow.jobAdapter().getJob(jobId).status),
+            uint8(AgentJobAdapter.JobStatus.Funded)
+        );
+
+        vm.warp(compensationDeadline);
+        workflow.expireCompensation(1);
+        workflow.expireCompensation(0);
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensationPendingMask(), 0);
+        assertEq(workflow.compensationUnresolvedMask(), 0x03);
+        assertEq(
+            uint8(workflow.jobAdapter().getJob(jobId).status),
+            uint8(AgentJobAdapter.JobStatus.Expired)
+        );
+    }
+
     function testFuzzSingleNodeExactAccounting(uint96 rawBudget) public {
         uint96 budget = uint96(bound(rawBudget, 1e6, 1_000e6));
         WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
         nodes[0] = _node(0, budget, 0, false, 0);
         WorkflowCoordinator workflow = _create(nodes, budget, 0);
         _fund(workflow);
-        assertTrue(workflow.accountingInvariantHolds());
         _activateSubmitComplete(workflow, 0);
-        assertTrue(workflow.accountingInvariantHolds());
         assertEq(workflow.paidToProviders(), budget);
     }
 
     function _createLinearWorkflow(bool withCompensation) internal returns (WorkflowCoordinator) {
         return _create(_linearNodes(withCompensation), EXECUTION_BUDGET, COMPENSATION_RESERVE);
+    }
+
+    function _prepareCompensatingWorkflow() internal returns (WorkflowCoordinator workflow) {
+        workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+        _activateSubmitComplete(workflow, 0);
+        _activateSubmitComplete(workflow, 1);
+        _rejectRiskNode(workflow);
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Compensating));
+        assertEq(workflow.compensationPendingMask(), 0x03);
     }
 
     function _linearNodes(bool withCompensation)
@@ -294,7 +636,6 @@ contract WorkflowCoordinatorTest is Test {
         usdc.mint(address(this), workflow.totalBudget());
         usdc.approve(address(workflow), workflow.totalBudget());
         workflow.fund();
-        assertTrue(workflow.accountingInvariantHolds());
     }
 
     function _activateSubmitComplete(WorkflowCoordinator workflow, uint8 nodeId) internal {

@@ -80,7 +80,10 @@ contract WorkflowInvariantTest is StdInvariant, Test {
     }
 
     function invariant_VaultAssetsAlwaysEqualRecordedLiabilities() public view {
-        assertTrue(workflow.accountingInvariantHolds());
+        assertEq(
+            usdc.balanceOf(address(workflow)),
+            workflow.available() + workflow.reservedForJobs() + workflow.reservedForCompensation()
+        );
     }
 
     function invariant_PaidRefundedReservedAvailableFeesNeverExceedDeposited() public view {
@@ -109,6 +112,29 @@ contract WorkflowInvariantTest is StdInvariant, Test {
         assertEq(receipt.finalizedBlock != 0, workflow.finalized());
     }
 
+    function invariant_TerminalWorkflowCannotContainActiveNodes() public view {
+        if (!workflow.finalized()) return;
+        for (uint8 i; i < workflow.nodeCount(); ++i) {
+            WorkflowCoordinator.NodeStatus status = workflow.getNode(i).status;
+            assertTrue(
+                status != WorkflowCoordinator.NodeStatus.Ready
+                    && status != WorkflowCoordinator.NodeStatus.Funded
+                    && status != WorkflowCoordinator.NodeStatus.Running
+                    && status != WorkflowCoordinator.NodeStatus.Submitted
+                    && status != WorkflowCoordinator.NodeStatus.Compensating
+            );
+        }
+    }
+
+    function invariant_CompensationCannotBePaidTwice() public view {
+        assertLe(workflow.compensationSpent(), 100e6);
+        assertEq(
+            workflow.compensatedMask() & workflow.compensationUnresolvedMask(),
+            0,
+            "compensation cannot be both paid and unresolved"
+        );
+    }
+
     function _node(uint8 id, uint16 dependencies)
         private
         view
@@ -129,4 +155,3 @@ contract WorkflowInvariantTest is StdInvariant, Test {
         });
     }
 }
-

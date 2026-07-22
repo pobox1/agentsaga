@@ -5,19 +5,27 @@ contract WorkflowReceiptRegistry {
     struct Receipt {
         address workflow;
         address owner;
+        address paymentToken;
         uint96 totalDeposited;
         uint96 providersPaid;
         uint96 compensationSpent;
         uint96 protocolFees;
         uint96 refunded;
+        uint96 configuredCompensationReserve;
         uint16 completedMask;
         uint16 failedMask;
+        uint16 skippedMask;
         uint16 compensatedMask;
+        uint16 compensationUnresolvedMask;
+        uint8 nodeCount;
         uint8 finalStatus;
+        uint48 globalDeadline;
+        uint64 policyVersion;
         uint64 createdBlock;
         uint64 finalizedBlock;
+        bytes32 dagSpecificationHash;
         bytes32 workflowSpecificationHash;
-        bytes32 finalEvidenceRoot;
+        bytes32 evidenceAccumulator;
         bytes32 executionTraceHash;
     }
 
@@ -34,7 +42,7 @@ contract WorkflowReceiptRegistry {
         address indexed workflow,
         address indexed owner,
         uint8 finalStatus,
-        bytes32 finalEvidenceRoot
+        bytes32 evidenceAccumulator
     );
 
     constructor(address workflowFactory) {
@@ -57,8 +65,7 @@ contract WorkflowReceiptRegistry {
         if (_receipts[msg.sender].finalizedBlock != 0) revert AlreadyFinalized();
         _receipts[msg.sender] = receipt;
         emit WorkflowReceiptFinalized(
-            msg.sender, receipt.owner, receipt.finalStatus, receipt.finalEvidenceRoot
+            msg.sender, receipt.owner, receipt.finalStatus, receipt.evidenceAccumulator
         );
     }
 }
-

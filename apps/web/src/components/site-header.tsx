@@ -7,6 +7,7 @@ const links = [
   ["Receipts", "/receipts"],
   ["Proof", "/proof"],
   ["Docs", "/docs"],
+  ["Status", "/status"],
 ] as const;
 
 export function SiteHeader() {
@@ -27,4 +28,3 @@ export function SiteHeader() {
     </header>
   );
 }
-
