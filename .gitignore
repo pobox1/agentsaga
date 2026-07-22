@@ -16,3 +16,5 @@ deployments/local.json
 .tools/
 *.log
 *.tsbuildinfo
+
+.vercel
