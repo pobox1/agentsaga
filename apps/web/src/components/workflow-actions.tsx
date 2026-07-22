@@ -4,10 +4,10 @@ import { useMemo, useState, useSyncExternalStore } from "react";
 import { formatUnits, getAddress, isAddress, keccak256, stringToHex, type Address, type ContractFunctionReturnType, type Hash } from "viem";
 import { useAccount, usePublicClient, useReadContract, useReadContracts, useSwitchChain, useWalletClient } from "wagmi";
 import { agentJobAdapterAbi, arcTestnet, erc20Abi, nodeStatusLabels, workflowCoordinatorAbi } from "@agentsaga/contracts";
-import { recoverPendingTransaction, trackPendingTransaction, type PendingTransaction, type TransactionAction } from "../lib/transactions";
+import { isTerminalTransactionStatus, pendingTransactionFromHash, recoverPendingTransaction, trackPendingTransaction, type PendingTransaction, type TransactionAction } from "../lib/transactions";
 
 type Dialog =
-  | { kind: "commitment"; key: string; functionName: "submit" | "complete" | "reject"; jobId: bigint; nodeId: number; compensation: boolean }
+  | { kind: "commitment"; key: string; functionName: "submit" | "complete" | "reject"; jobId: bigint; nodeId: number; compensation: boolean; provider: Address; evaluator: Address; budget: bigint }
   | { kind: "manual"; nodeId: number }
   | { kind: "remediation"; nodeId: number };
 
@@ -34,20 +34,43 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
   const pendingCompensation = useReadContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" });
   const allowance = useReadContract({ address: token, abi: erc20Abi, functionName: "allowance", args: account.address && token ? [account.address, workflow] : undefined, query: { enabled: Boolean(account.address && token) } });
 
-  async function transact(key: string, request: Parameters<NonNullable<typeof publicClient>["simulateContract"]>[0], details: { action: TransactionAction; expectedEvent: string; nodeId?: number | undefined; expectedAmount?: bigint | undefined }) {
+  async function transact(key: string, request: Parameters<NonNullable<typeof publicClient>["simulateContract"]>[0], details: { action: TransactionAction; expectedEvent: string } & Partial<Pick<PendingTransaction, "nodeId" | "expectedJobId" | "expectedOwner" | "expectedApprover" | "expectedProvider" | "expectedEvaluator" | "expectedSpender" | "expectedAmount" | "expectedFinalStatus" | "expectedDeliverableHash">>) {
     if (!account.address || !publicClient || !walletClient.data) throw new Error("Connect a wallet first");
     if (account.chainId !== arcTestnet.id) await switchChain.mutateAsync({ chainId: arcTestnet.id });
     if (await walletClient.data.getChainId() !== arcTestnet.id) throw new Error("Wallet provider is not on Arc Testnet");
+    const activeAddresses = await walletClient.data.getAddresses();
+    if (!activeAddresses.some((address) => address.toLowerCase() === account.address!.toLowerCase())) throw new Error("Connected account changed; review the action again");
     setBusy(key); setMessage(undefined);
     try {
+      if (details.nodeId !== undefined) {
+        const freshNode = await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "getNode", args: [details.nodeId] });
+        if (details.action === "activate-node" && Number(freshNode.status) !== 1) throw new Error("Node is no longer Ready");
+        if (details.action === "submit-job" && (Number(freshNode.status) !== 2 && Number(freshNode.status) !== 9 || freshNode.provider.toLowerCase() !== account.address.toLowerCase())) throw new Error("The active wallet is not the provider of a funded job");
+        if ((details.action === "complete-job" || details.action === "reject-job" || details.action === "complete-compensation") && (Number(freshNode.status) !== 4 && Number(freshNode.status) !== 9 || details.expectedEvaluator?.toLowerCase() !== account.address.toLowerCase())) throw new Error("The active wallet is not the evaluator of a submitted job");
+        if (details.action === "claim-expiry" && BigInt(nowSeconds()) < freshNode.expiry) throw new Error("The node deadline has not passed");
+        if ((details.action === "expire-compensation" || details.action === "open-compensation" || details.action === "declare-unresolved") && Number(freshNode.status) !== 5 && Number(freshNode.status) !== 9) throw new Error("Compensation is not pending for this node");
+        if (details.action === "open-compensation" || details.action === "expire-compensation" || details.action === "declare-unresolved") {
+          const freshMask = Number(await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" }));
+          const expectedNode = freshMask === 0 ? -1 : 31 - Math.clz32(freshMask);
+          if (expectedNode !== details.nodeId) throw new Error("Compensation must proceed in reverse dependency order");
+        }
+      }
+      if (details.action === "cancel-before-execution") {
+        const activationMask = await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "activationMask" });
+        if (activationMask !== 0) throw new Error("Cancellation is unavailable after execution starts");
+      }
+      if (details.action === "expire-workflow") {
+        const freshMask = await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" });
+        if (freshMask !== 0) throw new Error("Resolve pending compensation before expiring the workflow");
+      }
       const simulation = await publicClient.simulateContract({ ...request, account: account.address });
       const hash = await walletClient.data.writeContract(simulation.request);
-      const pending: PendingTransaction = { version: 1, action: details.action, chainId: arcTestnet.id, hash, workflow, nodeId: details.nodeId, createdAt: new Date().toISOString(), expectedEvent: details.expectedEvent, expectedOwner: account.address, expectedAmount: details.expectedAmount?.toString(), from: account.address };
+      const pending = await pendingTransactionFromHash(publicClient, { ...details, chainId: arcTestnet.id, hash, workflow, expectedEmitter: details.action === "approve-usdc" ? token! : workflow });
       trackPendingTransaction(pending);
       setMessage(`Submitted ${hash.slice(0, 10)}…`);
       await publicClient.waitForTransactionReceipt({ hash });
       const recovered = await recoverPendingTransaction(publicClient, pending);
-      if (recovered.status !== "Confirmed") throw new Error(recovered.error ?? recovered.status);
+      if (!isTerminalTransactionStatus(recovered.status) || recovered.status === "Reverted" || recovered.status === "Replaced" || recovered.status === "Dropped" || recovered.status === "ConfirmedVerificationIncomplete") throw new Error(recovered.error ?? recovered.status);
       setMessage(`Confirmed ${hash.slice(0, 10)}…`);
       await Promise.all([nodes.refetch(), allowance.refetch(), pendingCompensation.refetch()]);
     } finally { setBusy(undefined); }
@@ -56,8 +79,8 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
   async function approveAndFund() {
     if (!account.address || !token) return setMessage("Connect the owner wallet and configure the payment token.");
     try {
-      if ((allowance.data ?? 0n) < totalBudget) await transact("approve", { address: token, abi: erc20Abi, functionName: "approve", args: [workflow, totalBudget] }, { action: "approve-usdc", expectedEvent: "Approval", expectedAmount: totalBudget });
-      await transact("fund", { address: workflow, abi: workflowCoordinatorAbi, functionName: "fund" }, { action: "fund-workflow", expectedEvent: "WorkflowFunded", expectedAmount: totalBudget });
+      if ((allowance.data ?? 0n) < totalBudget) await transact("approve", { address: token, abi: erc20Abi, functionName: "approve", args: [workflow, totalBudget] }, { action: "approve-usdc", expectedEvent: "Approval", expectedOwner: account.address, expectedSpender: workflow, expectedAmount: totalBudget });
+      await transact("fund", { address: workflow, abi: workflowCoordinatorAbi, functionName: "fund" }, { action: "fund-workflow", expectedEvent: "WorkflowFunded", expectedOwner: account.address, expectedAmount: totalBudget });
     } catch (error) { setMessage(error instanceof Error ? error.message : "Transaction failed"); }
   }
 
@@ -68,20 +91,32 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
       expireCompensation: { action: "expire-compensation", expectedEvent: "CompensationUnresolved" }, declareCompensationUnresolved: { action: "declare-unresolved", expectedEvent: "CompensationUnresolved" },
       openNextCompensation: { action: "open-compensation", expectedEvent: "CompensationJobOpened" },
     };
-    try { await transact(key, { address: workflow, abi: workflowCoordinatorAbi, functionName, args }, { ...metadata[functionName], nodeId: typeof args?.[0] === "number" ? args[0] : undefined }); }
+    const nodeId = typeof args?.[0] === "number" ? args[0] : undefined;
+    try {
+      let lifecycleExpectation: Partial<Pick<PendingTransaction, "expectedJobId" | "expectedAmount" | "expectedProvider">> = {};
+      if (nodeId !== undefined && publicClient && adapter && (functionName === "activateNode" || functionName === "openNextCompensation")) {
+        const [freshNode, nextJobId] = await Promise.all([
+          publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "getNode", args: [nodeId] }),
+          publicClient.readContract({ address: adapter, abi: agentJobAdapterAbi, functionName: "nextJobId" }),
+        ]);
+        lifecycleExpectation = { expectedJobId: nextJobId, expectedAmount: functionName === "activateNode" ? freshNode.budget : freshNode.compensationBudget, ...(functionName === "openNextCompensation" && typeof args?.[1] === "string" ? { expectedProvider: getAddress(args[1]) } : {}) };
+      }
+      await transact(key, { address: workflow, abi: workflowCoordinatorAbi, functionName, args }, { ...metadata[functionName], ...lifecycleExpectation, ...(nodeId === undefined ? {} : { nodeId }), ...(functionName === "approveNode" && account.address ? { expectedApprover: account.address } : {}), ...(functionName === "expireWorkflow" ? { expectedFinalStatus: 8 } : {}), ...(functionName === "cancelBeforeExecution" ? { expectedFinalStatus: 7 } : {}) });
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Transaction failed"); }
   }
 
   async function adapterAction(dialogValue: Extract<Dialog, { kind: "commitment" }>, value: string) {
     if (!adapter || !value.trim()) throw new Error("A non-empty commitment is required");
     const action = dialogValue.functionName === "submit" ? "submit-job" : dialogValue.functionName === "complete" ? (dialogValue.compensation ? "complete-compensation" : "complete-job") : "reject-job";
-    const expectedEvent = dialogValue.functionName === "submit" ? "JobSubmitted" : dialogValue.functionName === "complete" ? "JobCompleted" : "JobRejected";
-    await transact(dialogValue.key, { address: adapter, abi: agentJobAdapterAbi, functionName: dialogValue.functionName, args: [dialogValue.jobId, commitment(value)] }, { action, expectedEvent, nodeId: dialogValue.nodeId });
+    const expectedEvent = dialogValue.functionName === "submit" ? "NodeSubmitted" : dialogValue.functionName === "complete" ? (dialogValue.compensation ? "CompensationCompleted" : "NodeCompleted") : "NodeRejected";
+    const evidence = commitment(value);
+    await transact(dialogValue.key, { address: adapter, abi: agentJobAdapterAbi, functionName: dialogValue.functionName, args: [dialogValue.jobId, evidence] }, { action, expectedEvent, nodeId: dialogValue.nodeId, expectedJobId: dialogValue.jobId, expectedProvider: dialogValue.provider, expectedEvaluator: dialogValue.evaluator, expectedAmount: dialogValue.budget, ...(dialogValue.functionName === "submit" ? { expectedDeliverableHash: evidence } : {}) });
   }
 
   async function claimExpiry(jobId: bigint, nodeId: number) {
     if (!adapter) return;
-    try { await transact(`refund-${nodeId}`, { address: adapter, abi: agentJobAdapterAbi, functionName: "claimRefund", args: [jobId] }, { action: "claim-expiry", expectedEvent: "JobExpired", nodeId }); }
+    try { await transact(`refund-${nodeId}`, { address: adapter, abi: agentJobAdapterAbi, functionName: "claimRefund", args: [jobId] }, { action: "claim-expiry", expectedEvent: "NodeRejected", nodeId, expectedJobId: jobId }); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Transaction failed"); }
   }
 
@@ -115,6 +150,7 @@ function NodeCard({ nodeId, node, account, owner, adapter, busy, compensationPen
   const provider = node.status === 9 && compensationJob.data ? compensationJob.data.provider : node.provider;
   const evaluator = node.status === 9 && compensationJob.data ? compensationJob.data.evaluator : node.evaluator;
   const adapterStatus = node.status === 9 && compensationJob.data ? compensationJob.data.status : undefined;
+  const effectiveBudget = node.status === 9 && compensationJob.data ? compensationJob.data.budget : node.budget;
   const isProvider = account?.toLowerCase() === provider.toLowerCase();
   const isEvaluator = account?.toLowerCase() === evaluator.toLowerCase();
   return <div className="node-editor"><strong>Node {nodeId + 1} · {nodeStatusLabels[node.status] ?? `Unknown (${node.status})`}</strong>
@@ -122,8 +158,8 @@ function NodeCard({ nodeId, node, account, owner, adapter, busy, compensationPen
     <div className="action-row">
       {node.status === 1 && <button type="button" disabled={busy} onClick={() => coordinatorAction(`activate-${nodeId}`, "activateNode", [nodeId])}>Activate</button>}
       {owner && node.humanApprovalRequired && !node.humanApproved && (node.status === 0 || node.status === 1) && <button type="button" disabled={busy} onClick={() => coordinatorAction(`approve-${nodeId}`, "approveNode", [nodeId])}>Approve node</button>}
-      {isProvider && (node.status === 2 || node.status === 9 && adapterStatus === 1) && <button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `submit-${nodeId}`, functionName: "submit", jobId: node.jobId, nodeId, compensation: node.status === 9 })}>Submit commitment</button>}
-      {isEvaluator && (node.status === 4 || node.status === 9 && adapterStatus === 2) && <><button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `complete-${nodeId}`, functionName: "complete", jobId: node.jobId, nodeId, compensation: node.status === 9 })}>Complete</button>{node.status !== 9 && <button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `reject-${nodeId}`, functionName: "reject", jobId: node.jobId, nodeId, compensation: false })}>Reject</button>}</>}
+      {isProvider && (node.status === 2 || node.status === 9 && adapterStatus === 1) && <button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `submit-${nodeId}`, functionName: "submit", jobId: node.jobId, nodeId, compensation: node.status === 9, provider, evaluator, budget: effectiveBudget })}>Submit commitment</button>}
+      {isEvaluator && (node.status === 4 || node.status === 9 && adapterStatus === 2) && <><button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `complete-${nodeId}`, functionName: "complete", jobId: node.jobId, nodeId, compensation: node.status === 9, provider, evaluator, budget: effectiveBudget })}>Complete</button>{node.status !== 9 && <button type="button" disabled={busy} onClick={() => setDialog({ kind: "commitment", key: `reject-${nodeId}`, functionName: "reject", jobId: node.jobId, nodeId, compensation: false, provider, evaluator, budget: node.budget })}>Reject</button>}</>}
       {(node.status === 2 || node.status === 4) && now >= Number(node.expiry) && <button type="button" disabled={busy} onClick={() => void claimExpiry(node.jobId, nodeId)}>Claim expiry refund</button>}
       {node.status === 9 && compensationPending && compensationJob.data && now >= Number(compensationJob.data.expiredAt) && <button type="button" disabled={busy} onClick={() => coordinatorAction(`expire-comp-${nodeId}`, "expireCompensation", [nodeId])}>Expire compensation</button>}
       {owner && compensationPending && node.compensationType === 1 && node.status === 5 && <button type="button" disabled={busy} onClick={() => setDialog({ kind: "remediation", nodeId })}>Open remediation job</button>}

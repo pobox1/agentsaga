@@ -35,3 +35,14 @@ forge script contracts/script/DeployArcTestnet.s.sol:DeployArcTestnet \
 After confirmation, record transaction receipts and addresses in `deployments/arc-testnet.json`,
 verify source on ArcScan, then run `pnpm --filter @agentsaga/contracts verify:deployment` with the
 recorded addresses. Do not create the deployment JSON before those values exist onchain.
+# Persistent orchestrator processes
+
+The orchestrator is not a Vercel serverless workload. Deploy the compiled package as three independently restarted processes sharing PostgreSQL, Redis and the same deployment configuration:
+
+```text
+pnpm --filter @agentsaga/orchestrator start
+pnpm --filter @agentsaga/orchestrator start:worker
+pnpm --filter @agentsaga/orchestrator start:indexer
+```
+
+Production configuration requires `DATABASE_URL`, `REDIS_URL`, at least one API token, `WORKFLOW_FACTORY_ADDRESS`, `FACTORY_DEPLOYMENT_BLOCK`, and an allowlisted `CORS_ORIGINS`. Run the Prisma migrations before starting any process. `/ready` remains HTTP 503 until Arc RPC, the database, Redis, all processor heartbeats, the factory cursor, and deployment configuration are simultaneously available.

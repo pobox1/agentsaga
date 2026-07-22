@@ -6,7 +6,7 @@ Starting branch: `agent/arc-testnet-production-readiness`
 
 Starting commit: `366dc14258ed684e3f99a652f064a8c2d6160e50`
 
-Pull request: [pobox1/agentsaga#1](https://github.com/pobox1/agentsaga/pull/1), open draft, base `main`, merge state `CLEAN`.
+Pull request: [pobox1/agentsaga#1](https://github.com/pobox1/agentsaga/pull/1), merged into `main` at `704a7d9d5f743b80444293d0d71faa340688c213` on 2026-07-22.
 
 Starting CI: [run 29916080421](https://github.com/pobox1/agentsaga/actions/runs/29916080421), successful for contracts, TypeScript, and secrets.
 

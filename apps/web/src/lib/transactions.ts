@@ -1,204 +1,168 @@
-import {
-  decodeEventLog,
-  type Address,
-  type Hash,
-  type PublicClient,
-  type TransactionReceipt,
-} from "viem";
-import {
-  agentJobAdapterAbi,
-  erc20Abi,
-  workflowCoordinatorAbi,
-  workflowFactoryAbi,
-} from "@agentsaga/contracts";
+import type { Address, Hash, PublicClient, TransactionReceipt } from "viem";
+import { decodeProjectEvents, verifyCurrentState, verifyTransactionEvent } from "./transaction-verification";
 
-export type TransactionAction =
-  | "create-workflow"
-  | "approve-usdc"
-  | "fund-workflow"
-  | "activate-node"
-  | "approve-node"
-  | "submit-job"
-  | "complete-job"
-  | "reject-job"
-  | "claim-expiry"
-  | "open-compensation"
-  | "complete-compensation"
-  | "expire-compensation"
-  | "declare-unresolved"
-  | "expire-workflow"
-  | "cancel-before-execution";
+export type TransactionAction = "create-workflow" | "approve-usdc" | "fund-workflow" | "activate-node" | "approve-node" | "submit-job" | "complete-job" | "reject-job" | "claim-expiry" | "open-compensation" | "complete-compensation" | "expire-compensation" | "declare-unresolved" | "expire-workflow" | "cancel-before-execution";
 
 export type PendingTransaction = {
-  version: 1;
+  version: 2;
   action: TransactionAction;
   chainId: number;
   hash: Hash;
-  workflow?: Address | undefined;
-  nodeId?: number | undefined;
+  from: Address;
+  nonce: number;
+  workflow?: Address;
+  nodeId?: number;
+  jobId?: bigint;
+  expectedJobId?: bigint;
+  expectedEmitter?: Address;
+  expectedEvent?: string;
+  expectedOwner?: Address;
+  expectedApprover?: Address;
+  expectedProvider?: Address;
+  expectedEvaluator?: Address;
+  expectedSpender?: Address;
+  expectedAmount?: bigint;
+  expectedFinalStatus?: number;
+  expectedSpecificationHash?: Hash;
+  expectedDeliverableHash?: Hash;
   createdAt: string;
-  expectedEvent?: string | undefined;
-  expectedOwner?: Address | undefined;
-  expectedAmount?: string | undefined;
-  from?: Address | undefined;
-  nonce?: number | undefined;
+  lastCheckedAt?: string;
+  recoveryAttempts: number;
 };
 
-export type TransactionCenterStatus =
-  | "Preparing"
-  | "Awaiting signature"
-  | "Submitted"
-  | "Confirming"
-  | "Confirmed"
-  | "Reverted"
-  | "Replaced"
-  | "Recovery required";
+export type TransactionCenterStatus = "Preparing" | "AwaitingSignature" | "Submitted" | "Confirming" | "ConfirmedEventVerified" | "ConfirmedStateVerified" | "ConfirmedVerificationIncomplete" | "Reverted" | "Replaced" | "Dropped" | "RecoveryPaused" | "Dismissed";
+export type VerificationMethod = "event" | "state" | "incomplete" | "none";
+export type TransactionRecord = PendingTransaction & { status: TransactionCenterStatus; confirmedAt?: string; decodedEvent?: string; decodedEvents?: string[]; verificationMethod?: VerificationMethod; errorCode?: string; error?: string; resultingWorkflow?: Address; replacementHash?: Hash };
 
-export type TransactionRecord = PendingTransaction & {
-  status: TransactionCenterStatus;
-  confirmedAt?: string | undefined;
-  decodedEvent?: string | undefined;
-  error?: string | undefined;
-  resultingWorkflow?: Address | undefined;
-};
-
-const pendingKey = "agentsaga:pending-transactions:v1";
-const historyKey = "agentsaga:transaction-history:v1";
+const pendingKey = "agentsaga:pending-transactions:v2";
+const historyKey = "agentsaga:transaction-history:v2";
+const legacyPendingKey = "agentsaga:pending-transactions:v1";
+const legacyHistoryKey = "agentsaga:transaction-history:v1";
 export const transactionUpdateEvent = "agentsaga:transactions-updated";
+export const maximumAutomaticRecoveryAttempts = 8;
 const hashPattern = /^0x[a-fA-F0-9]{64}$/;
 const addressPattern = /^0x[a-fA-F0-9]{40}$/;
+const actions = new Set<string>(["create-workflow", "approve-usdc", "fund-workflow", "activate-node", "approve-node", "submit-job", "complete-job", "reject-job", "claim-expiry", "open-compensation", "complete-compensation", "expire-compensation", "declare-unresolved", "expire-workflow", "cancel-before-execution"] satisfies TransactionAction[]);
+const terminal = new Set<TransactionCenterStatus>(["ConfirmedEventVerified", "ConfirmedStateVerified", "ConfirmedVerificationIncomplete", "Reverted", "Replaced", "Dropped", "Dismissed"]);
+const statuses = new Set<TransactionCenterStatus>(["Preparing", "AwaitingSignature", "Submitted", "Confirming", "ConfirmedEventVerified", "ConfirmedStateVerified", "ConfirmedVerificationIncomplete", "Reverted", "Replaced", "Dropped", "RecoveryPaused", "Dismissed"]);
 
-function readArray(key: string): unknown[] {
+function parse(key: string): unknown[] {
   if (typeof window === "undefined") return [];
-  try {
-    const value: unknown = JSON.parse(window.localStorage.getItem(key) ?? "[]");
-    return Array.isArray(value) ? value : [];
-  } catch {
-    return [];
-  }
+  try { const value: unknown = JSON.parse(window.localStorage.getItem(key) ?? "[]", (_key, item: unknown) => isBigIntEnvelope(item) ? BigInt(item.$bigint) : item); return Array.isArray(value) ? value : []; }
+  catch { return []; }
 }
+function stringify(value: unknown) { return JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? { $bigint: item.toString() } : item); }
+function isBigIntEnvelope(value: unknown): value is { $bigint: string } { return typeof value === "object" && value !== null && "$bigint" in value && typeof (value as { $bigint?: unknown }).$bigint === "string"; }
+function validAddress(value: unknown): value is Address { return typeof value === "string" && addressPattern.test(value); }
+function validHash(value: unknown): value is Hash { return typeof value === "string" && hashPattern.test(value); }
 
 export function isPendingTransaction(value: unknown): value is PendingTransaction {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
-  return item.version === 1 && transactionActions.has(String(item.action))
-    && typeof item.chainId === "number" && Number.isInteger(item.chainId) && item.chainId > 0 && typeof item.hash === "string"
-    && hashPattern.test(item.hash) && typeof item.createdAt === "string"
-    && (item.workflow === undefined || typeof item.workflow === "string" && addressPattern.test(item.workflow));
+  return item.version === 2 && actions.has(String(item.action)) && Number.isInteger(item.chainId) && Number(item.chainId) > 0
+    && validHash(item.hash) && validAddress(item.from) && Number.isInteger(item.nonce) && Number(item.nonce) >= 0
+    && typeof item.createdAt === "string" && Number.isInteger(item.recoveryAttempts) && Number(item.recoveryAttempts) >= 0
+    && (item.workflow === undefined || validAddress(item.workflow)) && (item.expectedEmitter === undefined || validAddress(item.expectedEmitter))
+    && (item.nodeId === undefined || Number.isInteger(item.nodeId) && Number(item.nodeId) >= 0 && Number(item.nodeId) < 16);
 }
 
-const transactionActions = new Set<string>(["create-workflow", "approve-usdc", "fund-workflow", "activate-node", "approve-node", "submit-job", "complete-job", "reject-job", "claim-expiry", "open-compensation", "complete-compensation", "expire-compensation", "declare-unresolved", "expire-workflow", "cancel-before-execution"] satisfies TransactionAction[]);
-
-export function loadPendingTransactions(): PendingTransaction[] {
-  return readArray(pendingKey).filter(isPendingTransaction);
-}
-
-export function loadTransactionHistory(): TransactionRecord[] {
-  return readArray(historyKey).filter((value): value is TransactionRecord =>
-    isPendingTransaction(value) && typeof (value as TransactionRecord).status === "string");
-}
-
-function notify() {
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(transactionUpdateEvent));
-}
-
-function storeHistory(record: TransactionRecord) {
-  const history = loadTransactionHistory().filter((item) => item.hash !== record.hash);
-  window.localStorage.setItem(historyKey, JSON.stringify([record, ...history].slice(0, 100)));
-}
-
-export function trackPendingTransaction(record: PendingTransaction) {
-  const pending = loadPendingTransactions().filter((item) => item.hash !== record.hash);
-  window.localStorage.setItem(pendingKey, JSON.stringify([record, ...pending]));
-  storeHistory({ ...record, status: "Submitted" });
-  notify();
-}
-
-function finish(record: PendingTransaction, result: Omit<TransactionRecord, keyof PendingTransaction>) {
-  const pending = loadPendingTransactions().filter((item) => item.hash !== record.hash);
-  window.localStorage.setItem(pendingKey, JSON.stringify(pending));
-  storeHistory({ ...record, ...result });
-  notify();
-}
-
-const eventAbis = [workflowFactoryAbi, workflowCoordinatorAbi, agentJobAdapterAbi, erc20Abi] as const;
-
-function decodeExpectedEvent(receipt: TransactionReceipt, record: PendingTransaction) {
-  const coordinatorEvents = new Set([
-    "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated",
-    "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned",
-    "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded",
-  ]);
-  for (const log of receipt.logs) {
-    for (const abi of eventAbis) {
-      try {
-        const decoded = decodeEventLog({ abi, data: log.data, topics: log.topics });
-        if (record.expectedEvent && decoded.eventName !== record.expectedEvent) continue;
-        const args = decoded.args as Record<string, unknown>;
-        if (record.workflow && coordinatorEvents.has(decoded.eventName)
-          && log.address.toLowerCase() !== record.workflow.toLowerCase()) continue;
-        if (decoded.eventName === "Approval" && record.workflow
-          && String(args.spender).toLowerCase() !== record.workflow.toLowerCase()) continue;
-        if (record.nodeId !== undefined && (!("nodeId" in args) || Number(args.nodeId) !== record.nodeId)) continue;
-        if (record.expectedOwner && (!("owner" in args)
-          || String(args.owner).toLowerCase() !== record.expectedOwner.toLowerCase())) continue;
-        if (record.expectedAmount) {
-          const amount = "amount" in args ? args.amount : "value" in args ? args.value : undefined;
-          if (amount === undefined || String(amount) !== record.expectedAmount) continue;
-        }
-        const resultingWorkflow = decoded.eventName === "WorkflowCreated"
-          ? args.workflow as Address
-          : record.workflow;
-        return { eventName: decoded.eventName, resultingWorkflow };
-      } catch {
-        // Try the next project ABI; unknown third-party logs are expected.
-      }
-    }
+function migrateLegacy(): void {
+  if (typeof window === "undefined") return;
+  const migrate = (value: unknown): PendingTransaction | undefined => {
+    if (typeof value !== "object" || value === null) return undefined;
+    const old = value as Record<string, unknown>;
+    if (old.version !== 1 || !actions.has(String(old.action)) || !validHash(old.hash) || !validAddress(old.from) || !Number.isInteger(old.nonce) || Number(old.nonce) < 0 || !Number.isInteger(old.chainId) || typeof old.createdAt !== "string") return undefined;
+    const expectedAmount = typeof old.expectedAmount === "string" && /^\d+$/.test(old.expectedAmount) ? BigInt(old.expectedAmount) : undefined;
+    return { version: 2, action: old.action as TransactionAction, chainId: Number(old.chainId), hash: old.hash, from: old.from, nonce: Number(old.nonce), createdAt: old.createdAt, recoveryAttempts: 0,
+      ...(validAddress(old.workflow) ? { workflow: old.workflow } : {}), ...(typeof old.nodeId === "number" ? { nodeId: old.nodeId } : {}), ...(typeof old.expectedEvent === "string" ? { expectedEvent: old.expectedEvent } : {}), ...(validAddress(old.expectedOwner) ? { expectedOwner: old.expectedOwner } : {}), ...(expectedAmount === undefined ? {} : { expectedAmount }) };
+  };
+  if (window.localStorage.getItem(pendingKey) === null) {
+    const pending = parse(legacyPendingKey).map(migrate).filter((item): item is PendingTransaction => Boolean(item));
+    window.localStorage.setItem(pendingKey, stringify(pending));
   }
+  if (window.localStorage.getItem(historyKey) === null) {
+    const history = parse(legacyHistoryKey).map(migrate).filter((item): item is PendingTransaction => Boolean(item)).map((item) => ({ ...item, status: "RecoveryPaused" as const, errorCode: "LEGACY_RECORD_MIGRATED", error: "Review and retry this migrated transaction manually" }));
+    window.localStorage.setItem(historyKey, stringify(history));
+  }
+}
+
+export function loadPendingTransactions(): PendingTransaction[] { migrateLegacy(); return parse(pendingKey).filter(isPendingTransaction); }
+export function loadTransactionHistory(): TransactionRecord[] { migrateLegacy(); return parse(historyKey).filter((value): value is TransactionRecord => isPendingTransaction(value) && statuses.has((value as TransactionRecord).status)); }
+function notify() { if (typeof window !== "undefined") window.dispatchEvent(new Event(transactionUpdateEvent)); }
+function savePending(records: PendingTransaction[]) { window.localStorage.setItem(pendingKey, stringify(records)); }
+function storeHistory(record: TransactionRecord) { const history = loadTransactionHistory().filter((item) => item.hash !== record.hash); window.localStorage.setItem(historyKey, stringify([record, ...history].slice(0, 100))); }
+function updatePending(record: PendingTransaction) { savePending([record, ...loadPendingTransactions().filter((item) => item.hash !== record.hash)]); }
+
+export function trackPendingTransaction(record: PendingTransaction) { updatePending(record); storeHistory({ ...record, status: "Submitted", verificationMethod: "none" }); notify(); }
+function finish(record: PendingTransaction, result: Omit<TransactionRecord, keyof PendingTransaction>) { savePending(loadPendingTransactions().filter((item) => item.hash !== record.hash)); const completed = { ...record, ...result }; storeHistory(completed); notify(); return completed; }
+
+export async function pendingTransactionFromHash(client: PublicClient, input: Omit<PendingTransaction, "version" | "from" | "nonce" | "createdAt" | "recoveryAttempts">): Promise<PendingTransaction> {
+  let lastError: unknown;
+  for (const delay of [0, 200, 500, 1_000, 2_000, 4_000]) {
+    if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+    try {
+      const transaction = await client.getTransaction({ hash: input.hash });
+      return { ...input, version: 2, from: transaction.from, nonce: transaction.nonce, createdAt: new Date().toISOString(), recoveryAttempts: 0 };
+    } catch (error) { lastError = error; }
+  }
+  throw new Error(`Transaction ${input.hash} was submitted but its nonce could not be read: ${lastError instanceof Error ? lastError.message : "RPC unavailable"}`);
+}
+
+export async function recoverPendingTransaction(client: PublicClient, record: PendingTransaction, options: { manual?: boolean } = {}): Promise<TransactionRecord> {
+  if (!options.manual && record.recoveryAttempts >= maximumAutomaticRecoveryAttempts) return pause(record, "RETRY_LIMIT_REACHED", "Automatic recovery paused; retry or dismiss manually");
+  if (client.chain?.id !== record.chainId) return pause(record, "WRONG_CHAIN", `Switch to chain ${record.chainId}`);
+  const checking = { ...record, recoveryAttempts: record.recoveryAttempts + 1, lastCheckedAt: new Date().toISOString() };
+  updatePending(checking);
+  let receipt: TransactionReceipt;
+  try { receipt = await client.getTransactionReceipt({ hash: record.hash }); }
+  catch {
+    const unavailable = await recoverUnavailableHash(client, checking);
+    if (unavailable) return unavailable;
+    if (checking.recoveryAttempts >= maximumAutomaticRecoveryAttempts) return pause(checking, "RETRY_LIMIT_REACHED", "Transaction is still unavailable; automatic recovery paused");
+    const confirming: TransactionRecord = { ...checking, status: "Confirming", verificationMethod: "none", errorCode: "RECEIPT_NOT_AVAILABLE" };
+    storeHistory(confirming); notify(); return confirming;
+  }
+  if (receipt.status === "reverted") return finish(checking, { status: "Reverted", confirmedAt: new Date().toISOString(), verificationMethod: "none", errorCode: "TRANSACTION_REVERTED" });
+  const decodedEvents = decodeProjectEvents(receipt).map((item) => `${item.eventName}@${item.emitter}`);
+  const eventResult = verifyTransactionEvent(receipt, checking);
+  if (eventResult.verified) return finish(checking, { status: "ConfirmedEventVerified", confirmedAt: new Date().toISOString(), decodedEvent: eventResult.eventName, decodedEvents, verificationMethod: "event", ...(eventResult.workflow ? { resultingWorkflow: eventResult.workflow } : {}) });
+  const stateResult = await verifyCurrentState(client, checking);
+  if (stateResult.verified) return finish(checking, { status: "ConfirmedStateVerified", confirmedAt: new Date().toISOString(), decodedEvents, verificationMethod: "state", errorCode: eventResult.reasonCode, error: eventResult.details, ...(stateResult.workflow ? { resultingWorkflow: stateResult.workflow } : {}) });
+  return finish(checking, { status: "ConfirmedVerificationIncomplete", confirmedAt: new Date().toISOString(), decodedEvents, verificationMethod: "incomplete", errorCode: eventResult.reasonCode, error: `${eventResult.details}; ${stateResult.details}` });
+}
+
+async function recoverUnavailableHash(client: PublicClient, record: PendingTransaction): Promise<TransactionRecord | undefined> {
+  try { await client.getTransaction({ hash: record.hash }); return undefined; } catch { /* Continue with nonce evidence. */ }
+  try {
+    const [confirmedNonce, pendingNonce] = await Promise.all([
+      client.getTransactionCount({ address: record.from, blockTag: "latest" }),
+      client.getTransactionCount({ address: record.from, blockTag: "pending" }).catch(() => record.nonce),
+    ]);
+    if (confirmedNonce <= record.nonce) return undefined;
+    const replacementHash = await findReplacement(client, record.from, record.nonce);
+    return finish(record, { status: "Replaced", verificationMethod: "none", errorCode: "NONCE_CONFIRMED_BY_OTHER_TRANSACTION", error: pendingNonce > record.nonce ? "Sender nonce advanced and the original hash is unavailable" : "Confirmed nonce advanced past this transaction", ...(replacementHash ? { replacementHash } : {}) });
+  } catch { return undefined; }
+}
+
+async function findReplacement(client: PublicClient, from: Address, nonce: number): Promise<Hash | undefined> {
+  try {
+    const latest = await client.getBlockNumber();
+    for (let offset = 0n; offset < 20n && latest >= offset; offset++) {
+      const block = await client.getBlock({ blockNumber: latest - offset, includeTransactions: true });
+      const found = block.transactions.find((transaction) => typeof transaction !== "string" && transaction.nonce === nonce && transaction.from.toLowerCase() === from.toLowerCase());
+      if (found && typeof found !== "string") return found.hash;
+    }
+  } catch { /* Replacement hash is supplementary; nonce evidence remains authoritative. */ }
   return undefined;
 }
 
-export async function recoverPendingTransaction(
-  client: PublicClient,
-  record: PendingTransaction,
-): Promise<TransactionRecord> {
-  if (client.chain?.id !== record.chainId) {
-    return { ...record, status: "Recovery required", error: `Switch to chain ${record.chainId}` };
-  }
-  let receipt: TransactionReceipt;
-  try {
-    receipt = await client.getTransactionReceipt({ hash: record.hash });
-  } catch {
-    if (record.from && record.nonce !== undefined) {
-      const confirmedNonce = await client.getTransactionCount({ address: record.from });
-      if (confirmedNonce > record.nonce) {
-        const result = { ...record, status: "Replaced" as const, error: "Account nonce advanced without this hash" };
-        finish(record, result);
-        return result;
-      }
-    }
-    const result = { ...record, status: "Confirming" as const };
-    storeHistory(result);
-    return result;
-  }
-  if (receipt.status === "reverted") {
-    const result = { ...record, status: "Reverted" as const, confirmedAt: new Date().toISOString() };
-    finish(record, result);
-    return result;
-  }
-  const decoded = decodeExpectedEvent(receipt, record);
-  if (record.expectedEvent && !decoded) {
-    const result = { ...record, status: "Recovery required" as const, error: `Missing or mismatched ${record.expectedEvent}` };
-    storeHistory(result);
-    return result;
-  }
-  const result = {
-    ...record,
-    status: "Confirmed" as const,
-    confirmedAt: new Date().toISOString(),
-    decodedEvent: decoded?.eventName,
-    resultingWorkflow: decoded?.resultingWorkflow,
-  };
-  finish(record, result);
-  return result;
+function pause(record: PendingTransaction, errorCode: string, error: string): TransactionRecord { const pending = { ...record, lastCheckedAt: new Date().toISOString(), recoveryAttempts: maximumAutomaticRecoveryAttempts }; const paused = { ...pending, status: "RecoveryPaused" as const, verificationMethod: "none" as const, errorCode, error }; updatePending(pending); storeHistory(paused); notify(); return paused; }
+export async function retryTransactionRecovery(client: PublicClient, hash: Hash): Promise<TransactionRecord | undefined> { const record = loadPendingTransactions().find((item) => item.hash === hash); if (!record) return undefined; const reset = { ...record, recoveryAttempts: 0 }; updatePending(reset); return recoverPendingTransaction(client, reset, { manual: true }); }
+export function dismissTransaction(hash: Hash): TransactionRecord | undefined { const record = loadPendingTransactions().find((item) => item.hash === hash); if (!record) return undefined; return finish(record, { status: "Dismissed", verificationMethod: "none", errorCode: "DISMISSED_BY_USER" }); }
+export function isTerminalTransactionStatus(status: TransactionCenterStatus) { return terminal.has(status); }
+export function automaticRecoveryDue(record: PendingTransaction, now = Date.now()): boolean {
+  if (record.recoveryAttempts >= maximumAutomaticRecoveryAttempts) return false;
+  if (!record.lastCheckedAt) return true;
+  const delay = Math.min(60_000, 2_000 * 2 ** Math.max(0, record.recoveryAttempts - 1));
+  return now - Date.parse(record.lastCheckedAt) >= delay;
 }

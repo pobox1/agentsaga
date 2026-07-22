@@ -7,11 +7,11 @@ import {
   type Log,
   type PublicClient,
 } from "viem";
-import { arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi } from "@agentsaga/contracts";
+import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi } from "@agentsaga/contracts";
 
-export const trackedEventNames = ["WorkflowCreated", "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated", "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned", "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded", "WorkflowReceiptFinalized"] as const;
+export const trackedEventNames = ["WorkflowCreated", "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated", "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned", "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded", "JobCreated", "JobFunded", "JobSubmitted", "JobCompleted", "JobRejected", "JobExpired", "WorkflowReceiptFinalized"] as const;
 const trackedNames = new Set<string>(trackedEventNames);
-const trackedEventAbi = [...workflowFactoryAbi, ...workflowCoordinatorAbi, ...receiptRegistryAbi] as const;
+const trackedEventAbi = [...workflowFactoryAbi, ...workflowCoordinatorAbi, ...agentJobAdapterAbi, ...receiptRegistryAbi] as const;
 
 export interface DecodedIndexedEvent { eventName: string; payload: Record<string, unknown> }
 

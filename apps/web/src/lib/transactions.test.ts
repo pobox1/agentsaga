@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, type Address, type Hash, type PublicClient, type TransactionReceipt } from "viem";
 import { workflowCoordinatorAbi } from "@agentsaga/contracts";
-import { isPendingTransaction, loadPendingTransactions, recoverPendingTransaction, trackPendingTransaction, type PendingTransaction } from "./transactions";
+import { dismissTransaction, isPendingTransaction, loadPendingTransactions, maximumAutomaticRecoveryAttempts, pendingTransactionFromHash, recoverPendingTransaction, trackPendingTransaction, type PendingTransaction, type TransactionAction } from "./transactions";
+import { verifyTransactionEvent } from "./transaction-verification";
 
 const hash = `0x${"ab".repeat(32)}` as Hash;
 const workflow = `0x${"12".repeat(20)}` as Address;
 const owner = `0x${"34".repeat(20)}` as Address;
-const base: PendingTransaction = { version: 1, action: "fund-workflow", chainId: 5_042_002, hash, workflow, createdAt: "2026-07-22T00:00:00.000Z", expectedEvent: "WorkflowFunded", expectedOwner: owner, expectedAmount: "100" };
+const base: PendingTransaction = { version: 2, action: "fund-workflow", chainId: 5_042_002, hash, from: owner, nonce: 2, workflow, expectedEmitter: workflow, createdAt: "2026-07-22T00:00:00.000Z", recoveryAttempts: 0, expectedEvent: "WorkflowFunded", expectedOwner: owner, expectedAmount: 100n };
 
 class MemoryStorage {
   private values = new Map<string, string>();
@@ -20,7 +21,7 @@ beforeEach(() => {
 });
 
 function client(receipt?: TransactionReceipt, nonce = 0): PublicClient {
-  return { chain: { id: 5_042_002 }, getTransactionReceipt: async () => { if (!receipt) throw new Error("not found"); return receipt; }, getTransactionCount: async () => nonce } as unknown as PublicClient;
+  return { chain: { id: 5_042_002 }, getTransactionReceipt: async () => { if (!receipt) throw new Error("not found"); return receipt; }, getTransaction: async () => { throw new Error("not found"); }, getTransactionCount: async () => nonce } as unknown as PublicClient;
 }
 
 function fundedReceipt(status: "success" | "reverted" = "success"): TransactionReceipt {
@@ -29,8 +30,40 @@ function fundedReceipt(status: "success" | "reverted" = "success"): TransactionR
 
 describe("transaction recovery", () => {
   it("rejects unknown actions and malformed records", () => { expect(isPendingTransaction({ ...base, action: "invented" })).toBe(false); expect(isPendingTransaction(base)).toBe(true); });
-  it("decodes and completes the expected event", async () => { trackPendingTransaction(base); const result = await recoverPendingTransaction(client(fundedReceipt()), base); expect(result.status).toBe("Confirmed"); expect(result.decodedEvent).toBe("WorkflowFunded"); expect(loadPendingTransactions()).toEqual([]); });
+  it("decodes and completes the expected event", async () => { trackPendingTransaction(base); const result = await recoverPendingTransaction(client(fundedReceipt()), base); expect(result.status).toBe("ConfirmedEventVerified"); expect(result.decodedEvent).toBe("WorkflowFunded"); expect(loadPendingTransactions()).toEqual([]); });
   it("removes a reverted transaction from pending", async () => { trackPendingTransaction(base); expect((await recoverPendingTransaction(client(fundedReceipt("reverted")), base)).status).toBe("Reverted"); expect(loadPendingTransactions()).toEqual([]); });
-  it("requires event amount and owner to match", async () => { const result = await recoverPendingTransaction(client(fundedReceipt()), { ...base, expectedAmount: "101" }); expect(result.status).toBe("Recovery required"); });
-  it("detects wrong chain and nonce replacement", async () => { expect((await recoverPendingTransaction({ ...client(), chain: { id: 1 } } as PublicClient, base)).status).toBe("Recovery required"); trackPendingTransaction({ ...base, from: owner, nonce: 2 }); expect((await recoverPendingTransaction(client(undefined, 3), { ...base, from: owner, nonce: 2 })).status).toBe("Replaced"); });
+  it("requires event amount and owner to match", async () => { const result = await recoverPendingTransaction(client(fundedReceipt()), { ...base, expectedAmount: 101n }); expect(result.status).toBe("ConfirmedVerificationIncomplete"); });
+  it("uses fresh state when a successful receipt has no decodable event", async () => {
+    const stateClient = { ...client({ status: "success", logs: [] } as unknown as TransactionReceipt), readContract: async () => 100n } as unknown as PublicClient;
+    expect((await recoverPendingTransaction(stateClient, base)).status).toBe("ConfirmedStateVerified");
+  });
+  it("persists the actual sender and nonce returned by RPC", async () => {
+    const rpc = { getTransaction: async () => ({ from: owner, nonce: 17 }) } as unknown as PublicClient;
+    const pending = await pendingTransactionFromHash(rpc, { action: "fund-workflow", chainId: 5_042_002, hash, workflow });
+    expect(pending).toMatchObject({ version: 2, from: owner, nonce: 17, recoveryAttempts: 0 });
+  });
+  it("detects wrong chain and nonce replacement", async () => { expect((await recoverPendingTransaction({ ...client(), chain: { id: 1 } } as PublicClient, base)).status).toBe("RecoveryPaused"); trackPendingTransaction(base); expect((await recoverPendingTransaction(client(undefined, 3), base)).status).toBe("Replaced"); });
+  it("keeps a temporarily unavailable hash confirming without inventing replacement", async () => { trackPendingTransaction(base); expect((await recoverPendingTransaction(client(undefined, 2), base)).status).toBe("Confirming"); expect(loadPendingTransactions()).toHaveLength(1); });
+  it("bounds automatic recovery and supports dismiss", async () => { const exhausted = { ...base, recoveryAttempts: maximumAutomaticRecoveryAttempts }; trackPendingTransaction(exhausted); expect((await recoverPendingTransaction(client(), exhausted)).status).toBe("RecoveryPaused"); expect(dismissTransaction(hash)?.status).toBe("Dismissed"); expect(loadPendingTransactions()).toEqual([]); });
+  it("verifies an ownerless coordinator event by node and job id", () => {
+    const receipt = { status: "success", logs: [{ address: workflow, topics: encodeEventTopics({ abi: workflowCoordinatorAbi, eventName: "NodeActivated", args: { nodeId: 3, jobId: 44n } }), data: encodeAbiParameters([{ type: "uint96" }], [50n]) }] } as TransactionReceipt;
+    const record = { ...base, action: "activate-node" as const, nodeId: 3, expectedJobId: 44n, expectedAmount: 50n, expectedEvent: "NodeActivated" };
+    expect(verifyTransactionEvent(receipt, record).verified).toBe(true);
+    expect(verifyTransactionEvent(receipt, { ...record, expectedJobId: 45n })).toMatchObject({ verified: false, reasonCode: "JOB_ID_MISMATCH" });
+  });
+  it("rejects a correct same-named event from the wrong emitter", () => {
+    const wrong = `0x${"56".repeat(20)}` as Address;
+    const receipt = { ...fundedReceipt(), logs: fundedReceipt().logs.map((log) => ({ ...log, address: wrong })) } as TransactionReceipt;
+    expect(verifyTransactionEvent(receipt, base)).toMatchObject({ verified: false, reasonCode: "WRONG_EVENT_EMITTER" });
+  });
+  it("migrates valid v1 records and ignores invalid legacy records", () => {
+    window.localStorage.setItem("agentsaga:pending-transactions:v1", JSON.stringify([{ ...base, version: 1, expectedAmount: "100" }, { version: 1, action: "fund-workflow" }]));
+    const records = loadPendingTransactions(); expect(records).toHaveLength(1); expect(records[0]).toMatchObject({ version: 2, nonce: 2, expectedAmount: 100n });
+  });
+  it.each([
+    "create-workflow", "approve-usdc", "fund-workflow", "activate-node", "approve-node", "submit-job", "complete-job", "reject-job", "claim-expiry", "open-compensation", "complete-compensation", "expire-compensation", "declare-unresolved", "expire-workflow", "cancel-before-execution",
+  ] satisfies TransactionAction[])("has an explicit verifier for %s", (action) => {
+    const result = verifyTransactionEvent({ status: "success", logs: [] } as unknown as TransactionReceipt, { ...base, action });
+    expect(result).toMatchObject({ verified: false, reasonCode: "EXPECTED_EVENT_MISSING" });
+  });
 });

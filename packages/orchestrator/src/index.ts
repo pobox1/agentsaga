@@ -4,6 +4,8 @@ export * from "./engine.js";
 export * from "./evaluators.js";
 export * from "./hash.js";
 export * from "./indexer.js";
+export * from "./transaction-signer.js";
+export * from "./worker-runtime.js";
 export * from "./config.js";
 export * from "./circle-wallet.js";
 export * from "./postgres.js";
