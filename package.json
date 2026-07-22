@@ -13,5 +13,8 @@
     "test": "pnpm -r test",
     "test:contracts": "./.tools/foundry/forge test -vvv",
     "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "next": "16.2.11"
   }
 }
