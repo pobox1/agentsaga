@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
+    "verify:deployment": "tsx src/verify-deployment.ts",
     "lint": "tsc --noEmit",
     "test": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
@@ -16,7 +17,8 @@
     "viem": "2.55.5"
   },
   "devDependencies": {
+    "@types/node": "24.10.1",
+    "tsx": "4.20.6",
     "typescript": "5.9.3"
   }
 }
-

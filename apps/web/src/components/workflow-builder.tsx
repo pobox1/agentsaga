@@ -1,7 +1,10 @@
 "use client";
 
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 import {
+  decodeEventLog,
+  encodeAbiParameters,
   getAddress,
   formatUnits,
   isAddress,
@@ -10,8 +13,9 @@ import {
   stringToHex,
   type Address,
 } from "viem";
-import { useAccount, useWaitForTransactionReceipt, useWriteContract } from "wagmi";
+import { useAccount, usePublicClient, useSwitchChain, useWalletClient } from "wagmi";
 import {
+  arcTestnet,
   ARC_TESTNET_USDC,
   workflowFactoryAbi,
 } from "@agentsaga/contracts";
@@ -71,9 +75,20 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
   const [deadlineDays, setDeadlineDays] = useState("5");
   const [metadataUri, setMetadataUri] = useState("urn:agentsaga:workflow:draft");
   const [formError, setFormError] = useState<string>();
+  const [pendingHash, setPendingHash] = useState<`0x${string}`>();
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const account = useAccount();
-  const write = useWriteContract();
-  const receipt = useWaitForTransactionReceipt({ hash: write.data });
+  const publicClient = usePublicClient({ chainId: arcTestnet.id });
+  const walletClient = useWalletClient({ chainId: arcTestnet.id });
+  const switchChain = useSwitchChain();
+  const router = useRouter();
+
+  useEffect(() => {
+    const recovered = window.localStorage.getItem("agentsaga:pending:create");
+    if (/^0x[a-fA-F0-9]{64}$/.test(recovered ?? "")) {
+      queueMicrotask(() => setPendingHash(recovered as `0x${string}`));
+    }
+  }, []);
 
   const totals = useMemo(() => {
     try {
@@ -92,12 +107,16 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
     setNodes((current) => current.map((node, nodeIndex) => nodeIndex === index ? { ...node, [key]: value } : node));
   };
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
     setFormError(undefined);
+    setIsSubmitting(true);
     try {
       if (factoryAddress === undefined) throw new Error("WorkflowFactory is not deployed/configured yet");
       if (!account.isConnected || account.address === undefined) throw new Error("Connect an Arc Testnet wallet first");
+      if (account.chainId !== arcTestnet.id) await switchChain.mutateAsync({ chainId: arcTestnet.id });
+      if (publicClient === undefined || walletClient.data === undefined) throw new Error("Arc wallet provider is unavailable");
+      if (await walletClient.data.getChainId() !== arcTestnet.id) throw new Error("Wallet provider is not on Arc Testnet");
       if (hasCycle(nodes)) throw new Error("The workflow graph contains a cycle");
       if (!totals.valid || totals.service === 0n) throw new Error("Enter valid node budgets");
       if (nodes.some((node) => !isAddress(node.provider) || !isAddress(node.evaluator))) {
@@ -112,41 +131,56 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
       const canonicalDag = nodes.map((node, id) => ({ id, name: node.name, dependencies: [...node.dependencies].sort() }));
       const dagHash = keccak256(stringToHex(JSON.stringify(canonicalDag)));
       const userSalt = keccak256(stringToHex(`${account.address}:${Date.now()}:${dagHash}`));
-      write.mutate({
+      const contractNodes = nodes.map((node, index) => {
+        const compensationBudget = parseUsdc(node.compensationBudget);
+        if (node.compensationPolicy === "manual" && compensationBudget !== 0n) {
+          throw new Error(`Manual recovery for node ${index + 1} must use a zero autonomous budget`);
+        }
+        return {
+          provider: getAddress(node.provider), evaluator: getAddress(node.evaluator),
+          budget: parseUsdc(node.budget), compensationBudget, expiry: deadline - 3_600,
+          dependencyMask: dependencyMask(node.dependencies),
+          specificationHash: keccak256(stringToHex(node.specification || `${node.name} specification`)),
+          compensationSpecificationHash: node.compensationPolicy === "none"
+            ? `0x${"0".repeat(64)}` as const
+            : keccak256(stringToHex(`compensate:${node.name}:${node.specification}`)),
+          compensationType: node.compensationPolicy === "none" ? 0 : node.compensationPolicy === "remediation" ? 1 : 2,
+          humanApprovalRequired: node.humanApproval,
+          metadataURI: `urn:agentsaga:node:${index}:${keccak256(stringToHex(node.name))}`,
+        };
+      });
+      const args = [ARC_TESTNET_USDC, totals.service, totals.compensation, deadline, dagHash, metadataUri, userSalt, contractNodes] as const;
+      const expectedSpecificationHash = keccak256(encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "bytes32" }, { type: "uint96" }, { type: "uint96" }, { type: "uint48" }, { type: "uint256" }],
+        [dagHash, keccak256(stringToHex(metadataUri)), totals.service, totals.compensation, deadline, BigInt(nodes.length)],
+      ));
+      const simulation = await publicClient.simulateContract({
+        account: account.address,
         address: factoryAddress,
         abi: workflowFactoryAbi,
         functionName: "createWorkflow",
-        args: [
-          ARC_TESTNET_USDC,
-          totals.service,
-          totals.compensation,
-          deadline,
-          dagHash,
-          metadataUri,
-          userSalt,
-          nodes.map((node, index) => {
-            const compensationBudget = parseUsdc(node.compensationBudget);
-            const specificationHash = keccak256(stringToHex(node.specification || `${node.name} specification`));
-            return {
-              provider: getAddress(node.provider),
-              evaluator: getAddress(node.evaluator),
-              budget: parseUsdc(node.budget),
-              compensationBudget,
-              expiry: deadline - 3_600,
-              dependencyMask: dependencyMask(node.dependencies),
-              specificationHash,
-              compensationSpecificationHash: compensationBudget === 0n
-                ? `0x${"0".repeat(64)}` as const
-                : keccak256(stringToHex(`compensate:${node.name}:${node.specification}`)),
-              compensationType: node.compensationPolicy === "none" ? 0 : node.compensationPolicy === "remediation" ? 1 : 5,
-              humanApprovalRequired: node.humanApproval,
-              metadataURI: `urn:agentsaga:node:${index}:${keccak256(stringToHex(node.name))}`,
-            };
-          }),
-        ],
+        args,
       });
+      const hash = await walletClient.data.writeContract(simulation.request);
+      setPendingHash(hash);
+      window.localStorage.setItem("agentsaga:pending:create", hash);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      const created = receipt.logs.map((log) => {
+        try { return decodeEventLog({ abi: workflowFactoryAbi, data: log.data, topics: log.topics }); }
+        catch { return undefined; }
+      }).find((log) => log?.eventName === "WorkflowCreated");
+      if (!created || created.eventName !== "WorkflowCreated") throw new Error("Confirmed transaction did not emit WorkflowCreated");
+      if (created.args.owner.toLowerCase() !== account.address.toLowerCase()) throw new Error("WorkflowCreated owner mismatch");
+      if (created.args.workflowSpecificationHash !== expectedSpecificationHash) throw new Error("Workflow specification commitment mismatch");
+      window.localStorage.setItem(`agentsaga:workflow:${created.args.workflow}`, JSON.stringify({
+        workflowId: created.args.workflowId.toString(), workflow: created.args.workflow, transactionHash: hash,
+      }));
+      window.localStorage.removeItem("agentsaga:pending:create");
+      router.push(`/workflows/${created.args.workflow}`);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Invalid workflow");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -196,8 +230,12 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
                   ))}
                   {index === 0 && <span className="muted">Root node</span>}
                 </div></div>
-                <label>Compensation policy<select value={node.compensationPolicy} onChange={(event) => updateNode(index, "compensationPolicy", event.target.value as BuilderNode["compensationPolicy"])}><option value="none">None required</option><option value="remediation">Open remediation job</option><option value="manual">Manual recovery</option></select></label>
-                <label>Compensation budget<input inputMode="decimal" value={node.compensationBudget} disabled={node.compensationPolicy === "none"} onChange={(event) => updateNode(index, "compensationBudget", event.target.value)} /></label>
+                <label>Compensation policy<select value={node.compensationPolicy} onChange={(event) => {
+                  const policy = event.target.value as BuilderNode["compensationPolicy"];
+                  updateNode(index, "compensationPolicy", policy);
+                  if (policy !== "remediation") updateNode(index, "compensationBudget", "0");
+                }}><option value="none">None required</option><option value="remediation">Open remediation job</option><option value="manual">Manual recovery</option></select></label>
+                <label>Compensation budget<input inputMode="decimal" value={node.compensationBudget} disabled={node.compensationPolicy !== "remediation"} onChange={(event) => updateNode(index, "compensationBudget", event.target.value)} /></label>
                 <label className="check-line span-2"><input type="checkbox" checked={node.humanApproval} onChange={(event) => updateNode(index, "humanApproval", event.target.checked)} /> Require operator approval before activation</label>
               </div>
               {nodes.length > 1 && <button className="text-button danger" type="button" onClick={() => setNodes((current) => current.filter((_, id) => id !== index).map((item) => ({ ...item, dependencies: item.dependencies.filter((dependency) => dependency !== index).map((dependency) => dependency > index ? dependency - 1 : dependency) })))}>Remove node</button>}
@@ -221,10 +259,8 @@ export function WorkflowBuilder({ factoryAddress }: { factoryAddress: Address | 
           <div className="validation-box"><span className={hasCycle(nodes) ? "state state-failed" : "state state-complete"}>{hasCycle(nodes) ? "Cycle detected" : "Graph is acyclic"}</span><p>Contract repeats bounded topological validation; the browser is not trusted.</p></div>
           {factoryAddress === undefined && <p className="form-message warning">Deployment address is not configured. The draft remains local.</p>}
           {formError !== undefined && <p className="form-message error" role="alert">{formError}</p>}
-          {write.error !== null && <p className="form-message error" role="alert">{write.error.message}</p>}
-          {write.data !== undefined && <p className="form-message success">Transaction submitted: {write.data.slice(0, 10)}…</p>}
-          {receipt.isSuccess && <p className="form-message success">Workflow factory transaction confirmed on Arc Testnet.</p>}
-          <button className="button button-primary button-full" type="submit" disabled={write.isPending || receipt.isLoading}>{write.isPending ? "Confirm in wallet…" : receipt.isLoading ? "Confirming…" : "Create workflow"}</button>
+          {pendingHash !== undefined && <p className="form-message success">Pending transaction: <a href={`${arcTestnet.blockExplorers.default.url}/tx/${pendingHash}`} target="_blank" rel="noreferrer">{pendingHash.slice(0, 10)}…</a></p>}
+          <button className="button button-primary button-full" type="submit" disabled={isSubmitting}>{isSubmitting ? "Simulating and confirming…" : "Create workflow"}</button>
           <p className="fine-print">Creation registers the coordinator. Funding is a separate exact-amount USDC approval and deposit step.</p>
         </div>
       </aside>

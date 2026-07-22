@@ -28,6 +28,7 @@ minimumReleaseAgeExclude:
   - react@19.2.8
   - viem@2.55.5
 allowBuilds:
+  '@prisma/client': true
   '@prisma/engines': true
   esbuild: true
   msgpackr-extract: true

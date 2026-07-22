@@ -4,9 +4,12 @@ import Link from "next/link";
 import { formatUnits, type Address } from "viem";
 import { useReadContracts } from "wagmi";
 import { workflowCoordinatorAbi, workflowStatusLabels } from "@agentsaga/contracts";
+import { WorkflowActions } from "./workflow-actions";
 
 const fields = [
   "owner",
+  "paymentToken",
+  "jobAdapter",
   "status",
   "nodeCount",
   "totalBudget",
@@ -22,6 +25,7 @@ const fields = [
   "failedMask",
   "skippedMask",
   "compensatedMask",
+  "compensationUnresolvedMask",
   "workflowSpecificationHash",
   "evidenceAccumulator",
   "executionTraceHash",
@@ -46,6 +50,10 @@ export function WorkflowDetail({ address }: { address: Address }) {
     const raw = value(name);
     return typeof raw === "bigint" ? formatUnits(raw, 6) : "—";
   };
+  const bigintValue = (name: typeof fields[number]) => {
+    const raw = value(name);
+    return typeof raw === "bigint" ? raw : 0n;
+  };
 
   if (reads.isLoading) return <div className="loading-card">Reading coordinator state from Arc RPC…</div>;
   if (reads.error !== null) return <div className="empty-state error"><h2>Coordinator read failed.</h2><p>{reads.error.message}</p></div>;
@@ -66,6 +74,7 @@ export function WorkflowDetail({ address }: { address: Address }) {
           return <div className="bitmap-node" key={id}><span>{String(id + 1).padStart(2, "0")}</span><strong>{state}</strong></div>;
         })}</div></div>
         <div className="panel proof-fields"><h2>Cryptographic commitments</h2><ProofField label="Workflow specification" value={String(value("workflowSpecificationHash") ?? "—")} /><ProofField label="Evidence accumulator" value={String(value("evidenceAccumulator") ?? "—")} /><ProofField label="Execution trace" value={String(value("executionTraceHash") ?? "—")} /></div>
+        <WorkflowActions workflow={address} owner={value("owner") as Address | undefined} token={value("paymentToken") as Address | undefined} adapter={value("jobAdapter") as Address | undefined} nodeCount={nodeCount} totalBudget={bigintValue("totalBudget")} deposited={bigintValue("deposited")} />
       </section>
       <aside className="detail-aside"><div className="panel"><p className="eyebrow">Vault liabilities</p><dl className="summary-list"><div><dt>Available</dt><dd>{money("available")}</dd></div><div><dt>Jobs reserved</dt><dd>{money("reservedForJobs")}</dd></div><div><dt>Compensation reserved</dt><dd>{money("reservedForCompensation")}</dd></div><div><dt>Protocol fees</dt><dd>{money("protocolFees")}</dd></div></dl><a className="button button-quiet button-full" href={`https://testnet.arcscan.app/address/${address}`} target="_blank" rel="noreferrer">Open in ArcScan</a><Link className="text-link" href={`/receipts/${address}`}>Open final receipt →</Link></div></aside>
     </div>
@@ -74,4 +83,3 @@ export function WorkflowDetail({ address }: { address: Address }) {
 
 function Metric({ label, value }: { label: string; value: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>USDC</small></div>; }
 function ProofField({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><code>{value}</code></div>; }
-

@@ -3,10 +3,12 @@ pragma solidity 0.8.30;
 
 import { IAgentJobCallback } from "./interfaces/IAgentJobCallback.sol";
 
-/// @notice Observable single-job lifecycle equivalent to the ERC-8183 core states.
-/// @dev Funds remain in the workflow vault. Only the coordinator can create/fund jobs, so a
-/// provider cannot renegotiate a funded workflow budget behind the vault's accounting.
+/// @notice Workflow-scoped adapter for the ERC-8183 core lifecycle.
+/// @dev This is not the full ERC-8183 reference interface: funds remain in the workflow vault,
+/// hooks and provider assignment are intentionally unsupported, and only the coordinator creates
+/// and funds jobs. Compatibility is documented as a matrix rather than claimed as compliance.
 contract AgentJobAdapter {
+    uint256 public constant MAX_DESCRIPTION_LENGTH = 2_048;
     enum JobStatus {
         Open,
         Funded,
@@ -35,6 +37,7 @@ contract AgentJobAdapter {
     error InvalidState();
     error BudgetMismatch();
     error EmptyCommitment();
+    error MetadataTooLong();
 
     address public immutable coordinator;
     address public immutable paymentToken;
@@ -83,6 +86,7 @@ contract AgentJobAdapter {
         }
         if (expiredAt <= block.timestamp) revert InvalidExpiry();
         if (specificationHash == bytes32(0)) revert EmptyCommitment();
+        if (bytes(description).length > MAX_DESCRIPTION_LENGTH) revert MetadataTooLong();
         jobId = nextJobId++;
         _jobs[jobId] = Job({
             client: coordinator,
@@ -168,4 +172,3 @@ contract AgentJobAdapter {
         emit JobExpired(jobId);
     }
 }
-

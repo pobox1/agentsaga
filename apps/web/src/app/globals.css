@@ -251,3 +251,10 @@ input:disabled { opacity: .5; }
 }
 
 :focus-visible { outline: 2px solid var(--lime); outline-offset: 3px; }
+.wallet-chooser { position: relative; }
+.wallet-menu { position: absolute; right: 0; top: calc(100% + .5rem); z-index: 20; min-width: 15rem; padding: .75rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--surface, #101418); box-shadow: 0 1rem 3rem rgba(0,0,0,.35); display: grid; gap: .5rem; }
+.wallet-menu button { width: 100%; padding: .65rem .75rem; text-align: left; border: 1px solid var(--line); border-radius: .5rem; background: transparent; color: inherit; cursor: pointer; }
+.wallet-menu p { margin: 0; max-width: 20rem; font-size: .8rem; }
+.action-row { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.action-row button { padding: .55rem .7rem; border: 1px solid var(--line); border-radius: .5rem; background: transparent; color: inherit; cursor: pointer; }
+.action-row button:disabled { cursor: wait; opacity: .55; }

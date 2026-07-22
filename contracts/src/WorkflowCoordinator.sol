@@ -13,7 +13,7 @@ import { IAgentJobCallback } from "./interfaces/IAgentJobCallback.sol";
 contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     using SafeERC20 for IERC20;
 
-    uint48 public constant MAX_COMPENSATION_GRACE = 7 days;
+    uint48 private constant MAX_COMPENSATION_GRACE = 7 days;
 
     enum WorkflowStatus {
         Draft,
@@ -45,9 +45,6 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     enum CompensationType {
         None,
         RemediationJob,
-        PredefinedRefundTransfer,
-        OperatorApproval,
-        EvaluatorApproval,
         ManualRecovery
     }
 
@@ -101,6 +98,26 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         bool unresolved;
     }
 
+    struct Config {
+        address owner;
+        address paymentToken;
+        address policyRegistry;
+        address receiptRegistry;
+        address treasury;
+        uint64 policyVersion;
+        uint48 globalDeadline;
+        uint96 totalBudget;
+        uint96 executionBudget;
+        uint96 configuredCompensationReserve;
+        uint96 humanApprovalThreshold;
+        uint96 maximumNodeBudget;
+        uint16 protocolFeeBps;
+        uint8 nodeCount;
+        uint16 allNodesMask;
+        bytes32 dagSpecificationHash;
+        bytes32 workflowSpecificationHash;
+    }
+
     error Unauthorized();
     error InvalidAddress();
     error InvalidBudget();
@@ -116,26 +133,12 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     error CompensationOrderViolation();
     error CompensationUnavailable();
     error EmergencyPaused();
+    error MetadataTooLong();
+    error AlreadyInitialized();
 
-    address public immutable owner;
-    IERC20 public immutable paymentToken;
-    PolicyRegistry public immutable policyRegistry;
-    WorkflowReceiptRegistry public immutable receiptRegistry;
-    AgentJobAdapter public immutable jobAdapter;
-    address public immutable treasury;
-    uint64 public immutable policyVersion;
-    uint64 public immutable createdBlock;
-    uint48 public immutable globalDeadline;
-    uint96 public immutable totalBudget;
-    uint96 public immutable executionBudget;
-    uint96 public immutable configuredCompensationReserve;
-    uint96 public immutable humanApprovalThreshold;
-    uint16 public immutable protocolFeeBps;
-    uint8 public immutable nodeCount;
-    uint16 public immutable allNodesMask;
-    bytes32 public immutable dagSpecificationHash;
-    bytes32 public immutable workflowSpecificationHash;
-    string public metadataURI;
+    AgentJobAdapter public jobAdapter;
+    uint64 private _createdBlock;
+    bool private _initialized;
 
     WorkflowStatus public status;
     bool public finalized;
@@ -159,7 +162,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     bytes32 public executionTraceHash;
 
     mapping(uint8 nodeId => Node node) private _nodes;
-    mapping(uint256 jobId => JobReference jobRef) public jobReferences;
+    mapping(uint256 jobId => JobReference jobRef) private _jobReferences;
     mapping(uint8 nodeId => Compensation compensation) private _compensations;
 
     event WorkflowFunded(address indexed owner, uint96 amount);
@@ -187,131 +190,127 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     event CompensationUnresolved(uint8 indexed nodeId, bytes32 evidenceHash);
     event Refunded(address indexed owner, uint96 amount);
 
-    constructor(
-        address workflowOwner,
-        address token,
-        PolicyRegistry registry,
-        WorkflowReceiptRegistry receipts,
-        uint96 workflowExecutionBudget,
-        uint96 compensationReserve,
-        uint48 deadline,
-        bytes32 dagHash,
-        string memory workflowMetadataURI,
-        NodeInput[] memory inputs
-    ) {
-        if (
-            workflowOwner == address(0) || token == address(0) || address(registry) == address(0)
-                || address(receipts) == address(0)
-        ) revert InvalidAddress();
-        if (deadline <= block.timestamp || dagHash == bytes32(0)) revert InvalidDeadline();
-        uint256 total = uint256(workflowExecutionBudget) + compensationReserve;
-        if (total > type(uint96).max || workflowExecutionBudget == 0) revert InvalidBudget();
+    constructor() {
+        _initialized = true;
+    }
 
-        PolicyRegistry.Limits memory snapshot = registry.validateWorkflow(
-            token, uint96(total), compensationReserve, uint8(inputs.length)
-        );
-
-        owner = workflowOwner;
-        paymentToken = IERC20(token);
-        policyRegistry = registry;
-        receiptRegistry = receipts;
-        treasury = registry.treasury();
-        policyVersion = registry.version();
-        createdBlock = uint64(block.number);
-        globalDeadline = deadline;
-        totalBudget = uint96(total);
-        executionBudget = workflowExecutionBudget;
-        configuredCompensationReserve = compensationReserve;
-        humanApprovalThreshold = snapshot.humanApprovalThreshold;
-        protocolFeeBps = snapshot.protocolFeeBps;
-        nodeCount = uint8(inputs.length);
-        allNodesMask = uint16((uint256(1) << inputs.length) - 1);
-        dagSpecificationHash = dagHash;
-        metadataURI = workflowMetadataURI;
-        workflowSpecificationHash = keccak256(
-            abi.encode(
-                dagHash,
-                keccak256(bytes(workflowMetadataURI)),
-                workflowExecutionBudget,
-                compensationReserve,
-                deadline,
-                inputs.length
-            )
-        );
-
-        AgentJobAdapter adapter = new AgentJobAdapter(token, address(this));
-        jobAdapter = adapter;
-
-        uint256 serviceSum;
-        uint256 compensationSum;
-        uint256 roots;
-        for (uint8 i; i < inputs.length; ++i) {
-            NodeInput memory input = inputs[i];
-            registry.validateNode(input.provider, input.evaluator, input.budget);
-            if (input.provider == address(0) || input.evaluator == address(0)) {
-                revert InvalidAddress();
-            }
-            if (input.expiry <= block.timestamp || input.expiry > deadline) {
-                revert InvalidDeadline();
-            }
-            if (input.specificationHash == bytes32(0)) revert InvalidNode();
-
-            uint16 bit = uint16(uint256(1) << i);
-            if ((input.dependencyMask & bit) != 0) revert InvalidGraph();
-            uint16 priorMask = i == 0 ? 0 : uint16((uint256(1) << i) - 1);
-            if ((input.dependencyMask & ~priorMask) != 0) revert InvalidGraph();
-            if (input.dependencyMask == 0) ++roots;
-
-            if (input.compensationType == CompensationType.None) {
-                if (input.compensationBudget != 0) revert InvalidBudget();
-            } else if (
-                input.compensationBudget == 0 || input.compensationSpecificationHash == bytes32(0)
-            ) {
-                revert InvalidBudget();
-            }
-
-            serviceSum += input.budget;
-            compensationSum += input.compensationBudget;
-            uint256 jobId = adapter.createJob(
-                input.provider,
-                input.evaluator,
-                input.expiry,
-                input.metadataURI,
-                input.specificationHash
-            );
-            adapter.setBudget(jobId, input.budget);
-            _nodes[i] = Node({
-                provider: input.provider,
-                evaluator: input.evaluator,
-                budget: input.budget,
-                compensationBudget: input.compensationBudget,
-                expiry: input.expiry,
-                dependencyMask: input.dependencyMask,
-                jobId: jobId,
-                specificationHash: input.specificationHash,
-                compensationSpecificationHash: input.compensationSpecificationHash,
-                compensationType: input.compensationType,
-                status: NodeStatus.Blocked,
-                humanApprovalRequired: input.humanApprovalRequired
-                    || input.budget >= snapshot.humanApprovalThreshold,
-                humanApproved: false,
-                metadataURI: input.metadataURI
-            });
-            jobReferences[jobId] = JobReference({ nodeId: i, compensation: false, exists: true });
-        }
-        if (
-            roots == 0 || serviceSum > workflowExecutionBudget
-                || compensationSum > compensationReserve
-        ) {
-            revert InvalidGraph();
-        }
+    function initialize() external {
+        if (_initialized) revert AlreadyInitialized();
+        if (msg.sender != _receiptRegistry().factory()) revert Unauthorized();
+        _initialized = true;
+        _createdBlock = uint64(block.number);
+        jobAdapter = new AgentJobAdapter(address(paymentToken()), address(this));
         status = WorkflowStatus.Draft;
         executionTraceHash =
-            keccak256(abi.encodePacked("AGENTSAGA_CREATE", workflowSpecificationHash));
+            keccak256(abi.encodePacked("AGENTSAGA_CREATE", workflowSpecificationHash()));
+    }
+
+    function initializeNode(uint8 nodeId, NodeInput calldata input, bool approvalRequired)
+        external
+    {
+        if (!_initialized || msg.sender != _receiptRegistry().factory()) {
+            revert Unauthorized();
+        }
+        uint256 jobId = jobAdapter.createJob(
+            input.provider,
+            input.evaluator,
+            input.expiry,
+            input.metadataURI,
+            input.specificationHash
+        );
+        jobAdapter.setBudget(jobId, input.budget);
+        _nodes[nodeId] = Node({
+            provider: input.provider,
+            evaluator: input.evaluator,
+            budget: input.budget,
+            compensationBudget: input.compensationBudget,
+            expiry: input.expiry,
+            dependencyMask: input.dependencyMask,
+            jobId: jobId,
+            specificationHash: input.specificationHash,
+            compensationSpecificationHash: input.compensationSpecificationHash,
+            compensationType: input.compensationType,
+            status: NodeStatus.Blocked,
+            humanApprovalRequired: approvalRequired,
+            humanApproved: false,
+            metadataURI: input.metadataURI
+        });
+        _jobReferences[jobId] = JobReference({ nodeId: nodeId, compensation: false, exists: true });
+    }
+
+    function _arg(uint256 slot) internal view returns (bytes32 value) {
+        assembly ("memory-safe") {
+            extcodecopy(address(), 0, add(0x2d, mul(slot, 0x20)), 0x20)
+            value := mload(0)
+        }
+    }
+
+    function owner() public view returns (address) {
+        return address(uint160(uint256(_arg(0))));
+    }
+
+    function paymentToken() public view returns (IERC20) {
+        return IERC20(address(uint160(uint256(_arg(1)))));
+    }
+
+    function _policyRegistry() internal view returns (PolicyRegistry) {
+        return PolicyRegistry(address(uint160(uint256(_arg(2)))));
+    }
+
+    function _receiptRegistry() internal view returns (WorkflowReceiptRegistry) {
+        return WorkflowReceiptRegistry(address(uint160(uint256(_arg(3)))));
+    }
+
+    function _treasury() internal view returns (address) {
+        return address(uint160(uint256(_arg(4))));
+    }
+
+    function _policyVersion() internal view returns (uint64) {
+        return uint64(uint256(_arg(5)));
+    }
+
+    function _globalDeadline() internal view returns (uint48) {
+        return uint48(uint256(_arg(6)));
+    }
+
+    function totalBudget() public view returns (uint96) {
+        return uint96(uint256(_arg(7)));
+    }
+
+    function _executionBudget() internal view returns (uint96) {
+        return uint96(uint256(_arg(8)));
+    }
+
+    function _configuredCompensationReserve() internal view returns (uint96) {
+        return uint96(uint256(_arg(9)));
+    }
+
+    function _maximumNodeBudget() internal view returns (uint96) {
+        return uint96(uint256(_arg(11)));
+    }
+
+    function _protocolFeeBps() internal view returns (uint16) {
+        return uint16(uint256(_arg(12)));
+    }
+
+    function nodeCount() public view returns (uint8) {
+        return uint8(uint256(_arg(13)));
+    }
+
+    function _allNodesMask() internal view returns (uint16) {
+        return uint16(uint256(_arg(14)));
+    }
+
+    function _dagSpecificationHash() internal view returns (bytes32) {
+        return _arg(15);
+    }
+
+    function workflowSpecificationHash() public view returns (bytes32) {
+        return _arg(16);
     }
 
     modifier onlyOwner() {
-        if (msg.sender != owner) revert Unauthorized();
+        if (msg.sender != owner()) revert Unauthorized();
         _;
     }
 
@@ -321,36 +320,33 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function getNode(uint8 nodeId) external view returns (Node memory) {
-        if (nodeId >= nodeCount) revert InvalidNode();
+        if (nodeId >= nodeCount()) revert InvalidNode();
         return _nodes[nodeId];
-    }
-
-    function getCompensation(uint8 nodeId) external view returns (Compensation memory) {
-        if (nodeId >= nodeCount) revert InvalidNode();
-        return _compensations[nodeId];
     }
 
     function fund() external onlyOwner nonReentrant {
         _requireNotPaused();
         if (status != WorkflowStatus.Draft) revert InvalidState();
-        uint256 beforeBalance = paymentToken.balanceOf(address(this));
-        paymentToken.safeTransferFrom(msg.sender, address(this), totalBudget);
-        uint256 received = paymentToken.balanceOf(address(this)) - beforeBalance;
-        if (received != totalBudget) revert FeeOnTransferUnsupported();
+        IERC20 token = paymentToken();
+        uint96 budget = totalBudget();
+        uint256 beforeBalance = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), budget);
+        uint256 received = token.balanceOf(address(this)) - beforeBalance;
+        if (received != budget) revert FeeOnTransferUnsupported();
 
-        deposited = totalBudget;
-        available = executionBudget;
-        reservedForCompensation = configuredCompensationReserve;
+        deposited = budget;
+        available = _executionBudget();
+        reservedForCompensation = _configuredCompensationReserve();
         _setStatus(WorkflowStatus.Funded);
         _setStatus(WorkflowStatus.Active);
         _refreshReadyNodes();
-        _recordTrace("FUND", type(uint8).max, bytes32(uint256(totalBudget)));
-        emit WorkflowFunded(owner, totalBudget);
+        _recordTrace("FUND", type(uint8).max, bytes32(uint256(budget)));
+        emit WorkflowFunded(owner(), budget);
         _assertAccounting();
     }
 
     function approveNode(uint8 nodeId) external onlyOwner {
-        if (nodeId >= nodeCount) revert InvalidNode();
+        if (nodeId >= nodeCount()) revert InvalidNode();
         Node storage node = _nodes[nodeId];
         if (!node.humanApprovalRequired) revert HumanApprovalRequired();
         if (node.humanApproved) revert AlreadyApproved();
@@ -363,7 +359,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
 
     function activateNode(uint8 nodeId) external nonReentrant {
         _requireNotPaused();
-        if (nodeId >= nodeCount) revert InvalidNode();
+        if (nodeId >= nodeCount()) revert InvalidNode();
         if (status != WorkflowStatus.Active && status != WorkflowStatus.PartiallyCompleted) {
             revert InvalidState();
         }
@@ -382,7 +378,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function onJobSubmitted(uint256 jobId, bytes32 deliverableHash) external onlyAdapter {
-        JobReference memory jobRef = jobReferences[jobId];
+        JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
         if (jobRef.compensation) {
             Compensation storage compensation = _compensations[jobRef.nodeId];
@@ -401,8 +397,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         onlyAdapter
         nonReentrant
     {
-        _requireNotPaused();
-        JobReference memory jobRef = jobReferences[jobId];
+        JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
         _recordEvidence(jobId, deliverableHash, reason);
         if (jobRef.compensation) {
@@ -414,7 +409,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function onJobRejected(uint256 jobId, bytes32 reason) external onlyAdapter {
-        JobReference memory jobRef = jobReferences[jobId];
+        JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
         _recordEvidence(jobId, bytes32(0), reason);
         if (jobRef.compensation) {
@@ -426,7 +421,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function onJobExpired(uint256 jobId) external onlyAdapter {
-        JobReference memory jobRef = jobReferences[jobId];
+        JobReference memory jobRef = _jobReferences[jobId];
         if (!jobRef.exists) revert InvalidNode();
         if (jobRef.compensation) {
             _failCompensation(jobRef.nodeId, keccak256("COMPENSATION_EXPIRED"));
@@ -442,22 +437,30 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         address evaluator,
         uint48 compensationDeadline
     ) external onlyOwner nonReentrant returns (uint256 jobId) {
-        _requireNotPaused();
-        if (status != WorkflowStatus.Compensating) revert InvalidState();
-        if (nodeId >= nodeCount || provider == address(0) || evaluator == address(0)) {
+        if (status != WorkflowStatus.Compensating) {
+            revert InvalidState();
+        }
+        if (nodeId >= nodeCount() || provider == address(0) || evaluator == address(0)) {
             revert InvalidNode();
         }
         if (nodeId != _highestPendingCompensation()) revert CompensationOrderViolation();
         if (
             compensationDeadline <= block.timestamp
-                || compensationDeadline > globalDeadline + MAX_COMPENSATION_GRACE
+                || compensationDeadline > _globalDeadline() + MAX_COMPENSATION_GRACE
         ) revert InvalidDeadline();
 
         Compensation storage compensation = _compensations[nodeId];
+        if (_nodes[nodeId].compensationType != CompensationType.RemediationJob) {
+            revert CompensationUnavailable();
+        }
         if (compensation.opened || compensation.resolved || compensation.unresolved) {
             revert CompensationUnavailable();
         }
-        policyRegistry.validateNode(provider, evaluator, compensation.budget);
+        // Recovery policy is snapshotted at workflow creation. Registry changes after funding
+        // cannot strand funds reserved for a previously accepted workflow.
+        if (compensation.budget == 0 || compensation.budget > _maximumNodeBudget()) {
+            revert InvalidBudget();
+        }
         jobId = jobAdapter.createJob(
             provider,
             evaluator,
@@ -472,19 +475,20 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         compensation.provider = provider;
         compensation.evaluator = evaluator;
         compensation.opened = true;
-        jobReferences[jobId] = JobReference({ nodeId: nodeId, compensation: true, exists: true });
+        _jobReferences[jobId] = JobReference({ nodeId: nodeId, compensation: true, exists: true });
         _nodes[nodeId].status = NodeStatus.Compensating;
         _recordTrace("COMP_OPEN", nodeId, bytes32(jobId));
         emit CompensationJobOpened(nodeId, jobId, provider, compensation.budget);
     }
 
     function declareCompensationUnresolved(uint8 nodeId, bytes32 evidenceHash) external onlyOwner {
-        if (status != WorkflowStatus.Compensating || nodeId >= nodeCount) revert InvalidState();
+        if (status != WorkflowStatus.Compensating || nodeId >= nodeCount()) revert InvalidState();
         if (nodeId != _highestPendingCompensation()) revert CompensationOrderViolation();
         Compensation storage compensation = _compensations[nodeId];
         if (compensation.opened || compensation.resolved || compensation.unresolved) {
             revert CompensationUnavailable();
         }
+        if (evidenceHash == bytes32(0)) revert InvalidNode();
         compensation.unresolved = true;
         compensation.evidenceHash = evidenceHash;
         compensationPendingMask &= ~uint16(uint256(1) << nodeId);
@@ -512,17 +516,17 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function expireWorkflow() external nonReentrant {
-        if (block.timestamp < globalDeadline) revert InvalidDeadline();
+        if (block.timestamp < _globalDeadline()) revert InvalidDeadline();
         if (finalized) revert InvalidState();
         _closeUnfinishedJobs(NodeStatus.Expired, keccak256("WORKFLOW_EXPIRED"));
         _finalize(WorkflowStatus.Expired);
     }
 
-    function accountingInvariantHolds() public view returns (bool) {
+    function _accountingInvariantHolds() internal view returns (bool) {
         uint256 accounted = uint256(available) + reservedForJobs + reservedForCompensation
             + paidToProviders + compensationSpent + refunded + protocolFees;
         return accounted == deposited
-            && paymentToken.balanceOf(address(this))
+            && paymentToken().balanceOf(address(this))
                 == uint256(available) + reservedForJobs + reservedForCompensation;
     }
 
@@ -534,12 +538,12 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         completedMask |= bit;
         reservedForJobs -= node.budget;
 
-        uint96 fee = uint96((uint256(node.budget) * protocolFeeBps) / 10_000);
+        uint96 fee = uint96((uint256(node.budget) * _protocolFeeBps()) / 10_000);
         uint96 providerPayment = node.budget - fee;
         paidToProviders += providerPayment;
         protocolFees += fee;
-        if (providerPayment != 0) paymentToken.safeTransfer(node.provider, providerPayment);
-        if (fee != 0) paymentToken.safeTransfer(treasury, fee);
+        if (providerPayment != 0) paymentToken().safeTransfer(node.provider, providerPayment);
+        if (fee != 0) paymentToken().safeTransfer(_treasury(), fee);
 
         _recordTrace("COMPLETE", nodeId, bytes32(jobId));
         emit NodeCompleted(nodeId, jobId, node.provider, providerPayment, fee);
@@ -568,10 +572,10 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function _propagateFailure(uint8 failedNodeId) private {
-        for (uint8 pass; pass < nodeCount; ++pass) {
+        for (uint8 pass; pass < nodeCount(); ++pass) {
             bool changed;
             uint16 stopMask = failedMask | skippedMask;
-            for (uint8 i; i < nodeCount; ++i) {
+            for (uint8 i; i < nodeCount(); ++i) {
                 Node storage candidate = _nodes[i];
                 if (
                     (candidate.status == NodeStatus.Blocked || candidate.status == NodeStatus.Ready)
@@ -590,7 +594,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     function _refreshReadyNodes() private {
         if (status != WorkflowStatus.Active && status != WorkflowStatus.PartiallyCompleted) return;
         uint16 stopMask = failedMask | skippedMask;
-        for (uint8 i; i < nodeCount; ++i) {
+        for (uint8 i; i < nodeCount(); ++i) {
             Node storage node = _nodes[i];
             if (
                 node.status == NodeStatus.Blocked && (node.dependencyMask & stopMask) == 0
@@ -603,7 +607,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function _maybeSettleExecution() private {
-        if (completedMask == allNodesMask) {
+        if (completedMask == _allNodesMask()) {
             _finalize(WorkflowStatus.Completed);
             return;
         }
@@ -611,7 +615,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function _executionIsTerminal() private view returns (bool) {
-        for (uint8 i; i < nodeCount; ++i) {
+        for (uint8 i; i < nodeCount(); ++i) {
             NodeStatus nodeStatus = _nodes[i].status;
             if (
                 nodeStatus != NodeStatus.Completed && nodeStatus != NodeStatus.Rejected
@@ -625,13 +629,10 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     function _planCompensation() private {
         uint16 pending;
         uint256 requiredBudget;
-        for (uint8 i; i < nodeCount; ++i) {
+        for (uint8 i; i < nodeCount(); ++i) {
             uint16 bit = uint16(uint256(1) << i);
             Node storage node = _nodes[i];
-            if (
-                (completedMask & bit) != 0 && node.compensationType != CompensationType.None
-                    && node.compensationBudget != 0
-            ) {
+            if ((completedMask & bit) != 0 && node.compensationType != CompensationType.None) {
                 pending |= bit;
                 requiredBudget += node.compensationBudget;
                 _compensations[i] = Compensation({
@@ -670,7 +671,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         compensationPendingMask &= ~uint16(uint256(1) << nodeId);
         compensatedMask |= uint16(uint256(1) << nodeId);
         _nodes[nodeId].status = NodeStatus.Compensated;
-        paymentToken.safeTransfer(compensation.provider, compensation.budget);
+        paymentToken().safeTransfer(compensation.provider, compensation.budget);
         _recordTrace("COMP_DONE", nodeId, evidenceHash);
         emit CompensationCompleted(nodeId, jobId, compensation.budget, evidenceHash);
         if (compensationPendingMask == 0) _finalizeFailedOutcome();
@@ -693,7 +694,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
 
     function _highestPendingCompensation() private view returns (uint8 highest) {
         if (compensationPendingMask == 0) revert CompensationUnavailable();
-        for (uint8 i; i < nodeCount; ++i) {
+        for (uint8 i; i < nodeCount(); ++i) {
             if ((compensationPendingMask & uint16(uint256(1) << i)) != 0) highest = i;
         }
     }
@@ -705,7 +706,7 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function _closeUnfinishedJobs(NodeStatus terminalStatus, bytes32 reason) private {
-        for (uint8 i; i < nodeCount; ++i) {
+        for (uint8 i; i < nodeCount(); ++i) {
             Node storage node = _nodes[i];
             if (node.status == NodeStatus.Funded || node.status == NodeStatus.Submitted) {
                 jobAdapter.expireFromCoordinator(node.jobId);
@@ -735,8 +736,8 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
         _setStatus(finalStatus);
         _recordTrace("FINALIZE", type(uint8).max, bytes32(uint256(uint8(finalStatus))));
         if (refundAmount != 0) {
-            paymentToken.safeTransfer(owner, refundAmount);
-            emit Refunded(owner, refundAmount);
+            paymentToken().safeTransfer(owner(), refundAmount);
+            emit Refunded(owner(), refundAmount);
         }
         _writeReceipt(finalStatus);
         _assertAccounting();
@@ -745,23 +746,31 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     function _writeReceipt(WorkflowStatus finalStatus) private {
         WorkflowReceiptRegistry.Receipt memory receipt = WorkflowReceiptRegistry.Receipt({
             workflow: address(this),
-            owner: owner,
+            owner: owner(),
+            paymentToken: address(paymentToken()),
             totalDeposited: deposited,
             providersPaid: paidToProviders,
             compensationSpent: compensationSpent,
             protocolFees: protocolFees,
             refunded: refunded,
+            configuredCompensationReserve: _configuredCompensationReserve(),
             completedMask: completedMask,
             failedMask: failedMask,
+            skippedMask: skippedMask,
             compensatedMask: compensatedMask,
+            compensationUnresolvedMask: compensationUnresolvedMask,
+            nodeCount: nodeCount(),
             finalStatus: uint8(finalStatus),
-            createdBlock: createdBlock,
+            globalDeadline: _globalDeadline(),
+            policyVersion: _policyVersion(),
+            createdBlock: _createdBlock,
             finalizedBlock: uint64(block.number),
-            workflowSpecificationHash: workflowSpecificationHash,
-            finalEvidenceRoot: evidenceAccumulator,
+            dagSpecificationHash: _dagSpecificationHash(),
+            workflowSpecificationHash: workflowSpecificationHash(),
+            evidenceAccumulator: evidenceAccumulator,
             executionTraceHash: executionTraceHash
         });
-        receiptRegistry.finalize(receipt);
+        _receiptRegistry().finalize(receipt);
     }
 
     function _recordEvidence(uint256 jobId, bytes32 deliverable, bytes32 reason) private {
@@ -781,10 +790,10 @@ contract WorkflowCoordinator is ReentrancyGuard, IAgentJobCallback {
     }
 
     function _requireNotPaused() private view {
-        if (policyRegistry.paused()) revert EmergencyPaused();
+        if (_policyRegistry().paused()) revert EmergencyPaused();
     }
 
     function _assertAccounting() private view {
-        if (!accountingInvariantHolds()) revert AccountingInvariantBroken();
+        if (!_accountingInvariantHolds()) revert AccountingInvariantBroken();
     }
 }

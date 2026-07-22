@@ -11,7 +11,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge fmt --check
-      - run: forge test
+      - run: forge build --sizes
+      - run: forge test -vv
+      - run: forge coverage --ir-minimum --report summary
+      - run: forge snapshot --check
+      - uses: crytic/slither-action@v0.4.1
+        with:
+          target: contracts/src
+          fail-on: high
 
   typescript:
     runs-on: ubuntu-latest
@@ -25,7 +32,16 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm --filter @agentsaga/web typecheck
-      - run: pnpm --filter @agentsaga/orchestrator typecheck
+      - run: pnpm -r typecheck
+      - run: pnpm -r lint
       - run: pnpm --filter @agentsaga/orchestrator test
+      - run: pnpm --filter @agentsaga/web test
       - run: pnpm --filter @agentsaga/web build
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
