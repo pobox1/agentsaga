@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model ChainCursor {
+  id             String   @id
+  chainId        Int
+  nextBlock      BigInt
+  lastBlockHash  String?
+  updatedAt      DateTime @updatedAt
+}
+
+model IndexedEvent {
+  id               String   @id
+  chainId          Int
+  transactionHash  String
+  logIndex         Int
+  blockNumber      BigInt
+  blockHash        String
+  eventName        String
+  payload          Json
+  createdAt        DateTime @default(now())
+
+  @@unique([chainId, transactionHash, logIndex])
+  @@index([chainId, blockNumber])
+}
+
+model WorkerAction {
+  id             String   @id
+  workflow       String
+  nodeId         Int?
+  action         String
+  idempotencyKey String   @unique
+  status         String
+  attempts       Int      @default(0)
+  lastError      String?
+  payload        Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([workflow, status])
+}
+

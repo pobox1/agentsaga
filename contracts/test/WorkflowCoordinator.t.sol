@@ -1,0 +1,335 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+
+import { Test } from "forge-std/Test.sol";
+import { MockUSDC } from "./mocks/MockUSDC.sol";
+import { PolicyRegistry } from "../src/PolicyRegistry.sol";
+import { WorkflowFactory } from "../src/WorkflowFactory.sol";
+import { WorkflowCoordinator } from "../src/WorkflowCoordinator.sol";
+import { WorkflowReceiptRegistry } from "../src/WorkflowReceiptRegistry.sol";
+import { AgentJobAdapter } from "../src/AgentJobAdapter.sol";
+
+contract WorkflowCoordinatorTest is Test {
+    uint96 internal constant NODE_BUDGET = 100e6;
+    uint96 internal constant EXECUTION_BUDGET = 500e6;
+    uint96 internal constant COMPENSATION_RESERVE = 100e6;
+    bytes32 internal constant DAG_HASH = keccak256("vendor-onboarding-v1");
+
+    MockUSDC internal usdc;
+    PolicyRegistry internal policy;
+    WorkflowFactory internal factory;
+    WorkflowReceiptRegistry internal receipts;
+
+    address internal treasury = makeAddr("treasury");
+    address internal compensationProvider = makeAddr("compensationProvider");
+    address internal compensationEvaluator = makeAddr("compensationEvaluator");
+
+    function setUp() public {
+        usdc = new MockUSDC();
+        policy = new PolicyRegistry(address(this), treasury, address(usdc));
+        factory = new WorkflowFactory(policy);
+        receipts = factory.receiptRegistry();
+    }
+
+    function testSuccessfulWorkflowProducesReceiptAndRefund() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+
+        for (uint8 i; i < 5; ++i) {
+            if (i == 3) workflow.approveNode(i);
+            _activateSubmitComplete(workflow, i);
+        }
+
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Completed));
+        assertTrue(workflow.finalized());
+        assertEq(workflow.completedMask(), 0x1f);
+        assertEq(workflow.failedMask(), 0);
+        assertEq(workflow.paidToProviders(), EXECUTION_BUDGET);
+        assertEq(workflow.refunded(), COMPENSATION_RESERVE);
+        assertTrue(workflow.accountingInvariantHolds());
+
+        WorkflowReceiptRegistry.Receipt memory receipt = receipts.getReceipt(address(workflow));
+        assertEq(receipt.workflow, address(workflow));
+        assertEq(receipt.totalDeposited, EXECUTION_BUDGET + COMPENSATION_RESERVE);
+        assertEq(receipt.providersPaid, EXECUTION_BUDGET);
+        assertEq(receipt.refunded, COMPENSATION_RESERVE);
+        assertEq(receipt.completedMask, 0x1f);
+        assertTrue(receipt.finalEvidenceRoot != bytes32(0));
+        assertTrue(receipt.executionTraceHash != bytes32(0));
+    }
+
+    function testMiddleFailureSkipsDescendantsAndCompensatesInReverseOrder() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+        _activateSubmitComplete(workflow, 0);
+        _activateSubmitComplete(workflow, 1);
+
+        workflow.activateNode(2);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        WorkflowCoordinator.Node memory risk = workflow.getNode(2);
+        vm.prank(risk.provider);
+        adapter.submit(risk.jobId, keccak256("risk-rejected-evidence"));
+        vm.prank(risk.evaluator);
+        adapter.reject(risk.jobId, keccak256("COUNTERPARTY_RISK_HIGH"));
+
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Compensating));
+        assertEq(workflow.failedMask(), 0x04);
+        assertEq(workflow.skippedMask(), 0x18);
+        assertEq(workflow.compensationPendingMask(), 0x03);
+        assertEq(uint8(workflow.getNode(3).status), uint8(WorkflowCoordinator.NodeStatus.Skipped));
+
+        vm.expectRevert(WorkflowCoordinator.CompensationOrderViolation.selector);
+        workflow.openNextCompensation(
+            0, compensationProvider, compensationEvaluator, uint48(block.timestamp + 1 days)
+        );
+
+        _openAndCompleteCompensation(workflow, 1, keccak256("undo-document-side-effect"));
+        _openAndCompleteCompensation(workflow, 0, keccak256("undo-research-side-effect"));
+
+        assertEq(
+            uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.PartiallyCompleted)
+        );
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensatedMask(), 0x03);
+        assertEq(workflow.compensationSpent(), 50e6);
+        assertEq(workflow.paidToProviders(), 200e6);
+        assertEq(workflow.refunded(), 350e6);
+        assertTrue(workflow.accountingInvariantHolds());
+
+        WorkflowReceiptRegistry.Receipt memory receipt = receipts.getReceipt(address(workflow));
+        assertEq(receipt.failedMask, 0x04);
+        assertEq(receipt.compensatedMask, 0x03);
+        assertEq(receipt.compensationSpent, 50e6);
+    }
+
+    function testPrematureChildActivationReverts() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        vm.expectRevert(WorkflowCoordinator.DependencyNotSatisfied.selector);
+        workflow.activateNode(1);
+    }
+
+    function testHumanApprovalRequired() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+        for (uint8 i; i < 3; ++i) {
+            _activateSubmitComplete(workflow, i);
+        }
+        vm.expectRevert(WorkflowCoordinator.HumanApprovalRequired.selector);
+        workflow.activateNode(3);
+        workflow.approveNode(3);
+        workflow.activateNode(3);
+    }
+
+    function testSelfDependencyAndForwardDependencyRejected() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = _linearNodes(false);
+        nodes[1].dependencyMask = 0x02;
+        vm.expectRevert(WorkflowCoordinator.InvalidGraph.selector);
+        _create(nodes, EXECUTION_BUDGET, COMPENSATION_RESERVE);
+
+        nodes = _linearNodes(false);
+        nodes[1].dependencyMask = 0x04;
+        vm.expectRevert(WorkflowCoordinator.InvalidGraph.selector);
+        _create(nodes, EXECUTION_BUDGET, COMPENSATION_RESERVE);
+    }
+
+    function testBudgetOverallocationRejected() public {
+        WorkflowCoordinator.NodeInput[] memory nodes = _linearNodes(false);
+        nodes[4].budget = 101e6;
+        vm.expectRevert(WorkflowCoordinator.InvalidGraph.selector);
+        _create(nodes, EXECUTION_BUDGET, COMPENSATION_RESERVE);
+    }
+
+    function testNoDoublePaymentOrFinalization() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        for (uint8 i; i < 5; ++i) {
+            if (i == 3) workflow.approveNode(i);
+            _activateSubmitComplete(workflow, i);
+        }
+
+        WorkflowCoordinator.Node memory last = workflow.getNode(4);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(last.evaluator);
+        vm.expectRevert(AgentJobAdapter.InvalidState.selector);
+        adapter.complete(last.jobId, keccak256("again"));
+
+        vm.expectRevert(WorkflowCoordinator.InvalidDeadline.selector);
+        workflow.expireWorkflow();
+    }
+
+    function testEmergencyPauseBlocksFundingAndActivation() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        policy.setPaused(true);
+        usdc.mint(address(this), workflow.totalBudget());
+        usdc.approve(address(workflow), workflow.totalBudget());
+        vm.expectRevert(WorkflowCoordinator.EmergencyPaused.selector);
+        workflow.fund();
+
+        policy.setPaused(false);
+        workflow.fund();
+        policy.setPaused(true);
+        vm.expectRevert(WorkflowCoordinator.EmergencyPaused.selector);
+        workflow.activateNode(0);
+    }
+
+    function testUnauthorizedProviderAndEvaluatorRejected() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.expectRevert(AgentJobAdapter.Unauthorized.selector);
+        adapter.submit(node.jobId, keccak256("forged"));
+
+        vm.prank(node.provider);
+        adapter.submit(node.jobId, keccak256("real"));
+        vm.expectRevert(AgentJobAdapter.Unauthorized.selector);
+        adapter.complete(node.jobId, keccak256("forged-eval"));
+    }
+
+    function testJobExpiryRefundsReservationAndStopsDescendants() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(false);
+        _fund(workflow);
+        workflow.activateNode(0);
+        WorkflowCoordinator.Node memory node = workflow.getNode(0);
+        vm.warp(node.expiry);
+        workflow.jobAdapter().claimRefund(node.jobId);
+        assertEq(workflow.failedMask(), 0x01);
+        assertEq(workflow.skippedMask(), 0x1e);
+        assertTrue(workflow.finalized());
+        assertEq(uint8(workflow.status()), uint8(WorkflowCoordinator.WorkflowStatus.Failed));
+        assertEq(workflow.refunded(), workflow.totalBudget());
+    }
+
+    function testUnresolvedCompensationIsRecordedAndUnusedReserveRefunded() public {
+        WorkflowCoordinator workflow = _createLinearWorkflow(true);
+        _fund(workflow);
+        _activateSubmitComplete(workflow, 0);
+        _activateSubmitComplete(workflow, 1);
+        _rejectRiskNode(workflow);
+
+        workflow.declareCompensationUnresolved(1, keccak256("MANUAL_RECOVERY_REQUIRED"));
+        workflow.declareCompensationUnresolved(0, keccak256("NO_PROVIDER_AVAILABLE"));
+
+        assertTrue(workflow.finalized());
+        assertEq(workflow.compensationUnresolvedMask(), 0x03);
+        assertEq(workflow.compensationSpent(), 0);
+        assertEq(workflow.refunded(), 400e6);
+    }
+
+    function testFuzzSingleNodeExactAccounting(uint96 rawBudget) public {
+        uint96 budget = uint96(bound(rawBudget, 1e6, 1_000e6));
+        WorkflowCoordinator.NodeInput[] memory nodes = new WorkflowCoordinator.NodeInput[](1);
+        nodes[0] = _node(0, budget, 0, false, 0);
+        WorkflowCoordinator workflow = _create(nodes, budget, 0);
+        _fund(workflow);
+        assertTrue(workflow.accountingInvariantHolds());
+        _activateSubmitComplete(workflow, 0);
+        assertTrue(workflow.accountingInvariantHolds());
+        assertEq(workflow.paidToProviders(), budget);
+    }
+
+    function _createLinearWorkflow(bool withCompensation) internal returns (WorkflowCoordinator) {
+        return _create(_linearNodes(withCompensation), EXECUTION_BUDGET, COMPENSATION_RESERVE);
+    }
+
+    function _linearNodes(bool withCompensation)
+        internal
+        view
+        returns (WorkflowCoordinator.NodeInput[] memory nodes)
+    {
+        nodes = new WorkflowCoordinator.NodeInput[](5);
+        nodes[0] = _node(0, NODE_BUDGET, withCompensation ? 20e6 : 0, false, 0);
+        nodes[1] = _node(1, NODE_BUDGET, withCompensation ? 30e6 : 0, false, 0x01);
+        nodes[2] = _node(2, NODE_BUDGET, 0, false, 0x02);
+        nodes[3] = _node(3, NODE_BUDGET, 0, true, 0x04);
+        nodes[4] = _node(4, NODE_BUDGET, 0, false, 0x08);
+    }
+
+    function _node(
+        uint8 id,
+        uint96 budget,
+        uint96 compensationBudget,
+        bool humanApproval,
+        uint16 dependencies
+    ) internal view returns (WorkflowCoordinator.NodeInput memory) {
+        return WorkflowCoordinator.NodeInput({
+            provider: address(uint160(0x1000 + id)),
+            evaluator: address(uint160(0x2000 + id)),
+            budget: budget,
+            compensationBudget: compensationBudget,
+            expiry: uint48(block.timestamp + 3 days),
+            dependencyMask: dependencies,
+            specificationHash: keccak256(abi.encode("node-spec", id)),
+            compensationSpecificationHash: compensationBudget == 0
+                ? bytes32(0)
+                : keccak256(abi.encode("comp-spec", id)),
+            compensationType: compensationBudget == 0
+                ? WorkflowCoordinator.CompensationType.None
+                : WorkflowCoordinator.CompensationType.RemediationJob,
+            humanApprovalRequired: humanApproval,
+            metadataURI: string(abi.encodePacked("ipfs://node-", vm.toString(id)))
+        });
+    }
+
+    function _create(
+        WorkflowCoordinator.NodeInput[] memory nodes,
+        uint96 execution,
+        uint96 compensation
+    ) internal returns (WorkflowCoordinator workflow) {
+        (, workflow) = factory.createWorkflow(
+            address(usdc),
+            execution,
+            compensation,
+            uint48(block.timestamp + 5 days),
+            DAG_HASH,
+            "ipfs://agentsaga-workflow",
+            keccak256(abi.encode(nodes.length, execution, compensation)),
+            nodes
+        );
+    }
+
+    function _fund(WorkflowCoordinator workflow) internal {
+        usdc.mint(address(this), workflow.totalBudget());
+        usdc.approve(address(workflow), workflow.totalBudget());
+        workflow.fund();
+        assertTrue(workflow.accountingInvariantHolds());
+    }
+
+    function _activateSubmitComplete(WorkflowCoordinator workflow, uint8 nodeId) internal {
+        workflow.activateNode(nodeId);
+        WorkflowCoordinator.Node memory node = workflow.getNode(nodeId);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        bytes32 deliverable = keccak256(abi.encode("deliverable", nodeId));
+        vm.prank(node.provider);
+        adapter.submit(node.jobId, deliverable);
+        vm.prank(node.evaluator);
+        adapter.complete(node.jobId, keccak256(abi.encode("approved", nodeId)));
+    }
+
+    function _rejectRiskNode(WorkflowCoordinator workflow) internal {
+        workflow.activateNode(2);
+        WorkflowCoordinator.Node memory node = workflow.getNode(2);
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(node.provider);
+        adapter.submit(node.jobId, keccak256("risk-evidence"));
+        vm.prank(node.evaluator);
+        adapter.reject(node.jobId, keccak256("RISK_REJECTED"));
+    }
+
+    function _openAndCompleteCompensation(
+        WorkflowCoordinator workflow,
+        uint8 nodeId,
+        bytes32 deliverable
+    ) internal {
+        uint256 jobId = workflow.openNextCompensation(
+            nodeId, compensationProvider, compensationEvaluator, uint48(block.timestamp + 1 days)
+        );
+        AgentJobAdapter adapter = workflow.jobAdapter();
+        vm.prank(compensationProvider);
+        adapter.submit(jobId, deliverable);
+        vm.prank(compensationEvaluator);
+        adapter.complete(jobId, keccak256("COMPENSATION_APPROVED"));
+    }
+}
