@@ -17,7 +17,7 @@ jobs:
       - run: forge snapshot --check
       - uses: crytic/slither-action@v0.4.1
         with:
-          target: contracts/src
+          target: .
           fail-on: high
 
   typescript:
@@ -45,3 +45,5 @@ jobs:
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
