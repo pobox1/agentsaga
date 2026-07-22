@@ -85,6 +85,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: forge build
+      - run: pnpm --filter @agentsaga/orchestrator exec prisma generate
       - run: pnpm --filter @agentsaga/orchestrator exec prisma validate
       - run: pnpm --filter @agentsaga/orchestrator exec prisma migrate deploy
       - run: pnpm --filter @agentsaga/orchestrator exec prisma migrate status
