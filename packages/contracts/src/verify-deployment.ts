@@ -12,6 +12,7 @@ const factoryPolicyAbi = [
   { type: "function", name: "policyRegistry", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
   { type: "function", name: "workflowImplementation", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
 ] as const;
+const multicall3Address = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 function requiredAddress(name: string) {
   const value = process.env[name];
@@ -29,16 +30,22 @@ const client = createPublicClient({ chain: arcTestnet, transport: http(process.e
 for (const [name, address] of [["policy", policy], ["factory", factory], ["receiptRegistry", receiptRegistry]] as const) {
   if ((await client.getCode({ address })) === undefined) throw new Error(`${name} has no runtime bytecode`);
 }
-const [linkedPolicy, linkedReceipt, implementation, owner, treasury, paused, version, usdcAllowed] = await Promise.all([
-  client.readContract({ address: factory, abi: factoryPolicyAbi, functionName: "policyRegistry" }),
-  client.readContract({ address: factory, abi: workflowFactoryAbi, functionName: "receiptRegistry" }),
-  client.readContract({ address: factory, abi: factoryPolicyAbi, functionName: "workflowImplementation" }),
-  client.readContract({ address: policy, abi: policyAbi, functionName: "owner" }),
-  client.readContract({ address: policy, abi: policyAbi, functionName: "treasury" }),
-  client.readContract({ address: policy, abi: policyAbi, functionName: "paused" }),
-  client.readContract({ address: policy, abi: policyAbi, functionName: "version" }),
-  client.readContract({ address: policy, abi: policyAbi, functionName: "allowedPaymentToken", args: [ARC_TESTNET_USDC] }),
-]);
+// Arc's public RPC enforces a low request limit. Collapse relationship and
+// configuration reads into one Multicall3 eth_call instead of issuing a burst.
+const [linkedPolicy, linkedReceipt, implementation, owner, treasury, paused, version, usdcAllowed] = await client.multicall({
+  allowFailure: false,
+  multicallAddress: multicall3Address,
+  contracts: [
+    { address: factory, abi: factoryPolicyAbi, functionName: "policyRegistry" },
+    { address: factory, abi: workflowFactoryAbi, functionName: "receiptRegistry" },
+    { address: factory, abi: factoryPolicyAbi, functionName: "workflowImplementation" },
+    { address: policy, abi: policyAbi, functionName: "owner" },
+    { address: policy, abi: policyAbi, functionName: "treasury" },
+    { address: policy, abi: policyAbi, functionName: "paused" },
+    { address: policy, abi: policyAbi, functionName: "version" },
+    { address: policy, abi: policyAbi, functionName: "allowedPaymentToken", args: [ARC_TESTNET_USDC] },
+  ],
+});
 if ((await client.getCode({ address: implementation })) === undefined || linkedPolicy !== policy || linkedReceipt !== receiptRegistry || owner !== expectedOwner || treasury !== expectedTreasury || paused || version < 1n || !usdcAllowed) {
   throw new Error("Deployment configuration verification failed");
 }

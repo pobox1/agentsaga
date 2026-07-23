@@ -1,14 +1,57 @@
 {
   "network": "arc-testnet",
   "chainId": 5042002,
-  "status": "not-deployed",
-  "deployer": null,
-  "owner": null,
-  "treasury": null,
+  "status": "deployed",
+  "deployer": "0x08458C4126655a9686e8B061adE6b7eEc366E6d5",
+  "owner": "0x08458C4126655a9686e8B061adE6b7eEc366E6d5",
+  "treasury": "0x08458C4126655a9686e8B061adE6b7eEc366E6d5",
   "usdc": "0x3600000000000000000000000000000000000000",
-  "contracts": {},
-  "transactions": [],
-  "sourceVerification": null,
-  "gitCommit": null,
-  "deploymentDate": null
+  "contracts": {
+    "PolicyRegistry": "0x94057115d9233Fc9d06bD3e7194C6A1d9C9654D8",
+    "WorkflowFactory": "0x9F638e3f31e82987A39f211cea062E44D0520A8a",
+    "WorkflowReceiptRegistry": "0x9264429565545f7875Ad0913392b2cb157B15C4E",
+    "WorkflowCoordinatorImplementation": "0xB38395DC4a20fE82C4481d4987A0BC3EDA9D5a56"
+  },
+  "transactions": [
+    {
+      "contract": "PolicyRegistry",
+      "hash": "0x88be8bd7beadb6d177720ec755b2867cdff1b59023d40fd402a09de2c7fe141e",
+      "block": 53222226,
+      "status": 1
+    },
+    {
+      "contract": "WorkflowFactory",
+      "hash": "0x4666e4ecdec8d0c09e3f901aea5bdf1eddcfd87126e56c6d2b54174470f78e2b",
+      "block": 53222226,
+      "status": 1
+    }
+  ],
+  "deploymentBlocks": {
+    "PolicyRegistry": 53222226,
+    "WorkflowFactory": 53222226,
+    "WorkflowReceiptRegistry": 53222226,
+    "WorkflowCoordinatorImplementation": 53222226
+  },
+  "sourceVerification": {
+    "status": "verified",
+    "verifier": "blockscout",
+    "compiler": "v0.8.30+commit.73712a01",
+    "optimizerEnabled": true,
+    "verifiedAt": "2026-07-23T08:20:54.077Z",
+    "contracts": {
+      "PolicyRegistry": "https://testnet.arcscan.app/address/0x94057115d9233fc9d06bd3e7194c6a1d9c9654d8?tab=contract",
+      "WorkflowFactory": "https://testnet.arcscan.app/address/0x9f638e3f31e82987a39f211cea062e44d0520a8a?tab=contract",
+      "WorkflowReceiptRegistry": "https://testnet.arcscan.app/address/0x9264429565545f7875ad0913392b2cb157b15c4e?tab=contract",
+      "WorkflowCoordinatorImplementation": "https://testnet.arcscan.app/address/0xb38395dc4a20fe82c4481d4987a0bc3eda9d5a56?tab=contract"
+    }
+  },
+  "configuration": {
+    "factoryPolicyRegistry": "0x94057115d9233Fc9d06bD3e7194C6A1d9C9654D8",
+    "factoryReceiptRegistry": "0x9264429565545f7875Ad0913392b2cb157B15C4E",
+    "factoryWorkflowImplementation": "0xB38395DC4a20fE82C4481d4987A0BC3EDA9D5a56",
+    "operatorModel": "testnet-single-operator",
+    "ownerTreasurySeparated": false
+  },
+  "gitCommit": "714ea4b24982ee454660eefb5360131981e5c459",
+  "deploymentDate": "2026-07-23T08:15:11.000Z"
 }
