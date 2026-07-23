@@ -6,6 +6,7 @@ import { useAccount, usePublicClient, useReadContract, useReadContracts, useSwit
 import { agentJobAdapterAbi, arcTestnet, erc20Abi, nodeStatusLabels, workflowCoordinatorAbi } from "@agentsaga/contracts";
 import { isTerminalTransactionStatus, pendingTransactionFromHash, recoverPendingTransaction, type PendingTransaction, type TransactionAction } from "../lib/transactions";
 import { canCancelWorkflow, canExpireWorkflow, coordinatorImmutableUint } from "../lib/workflow-controls";
+import { assertJobRole, effectiveJobContext } from "../lib/job-context";
 
 type Dialog =
   | { kind: "commitment"; key: string; functionName: "submit" | "complete" | "reject"; jobId: bigint; nodeId: number; compensation: boolean; provider: Address; evaluator: Address; budget: bigint }
@@ -49,10 +50,14 @@ export function WorkflowActions({ workflow, owner, token, adapter, nodeCount, to
     try {
       if (details.nodeId !== undefined) {
         const freshNode = await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "getNode", args: [details.nodeId] });
+        const compensationJob = Number(freshNode.status) === 9 && adapter
+          ? await publicClient.readContract({ address: adapter, abi: agentJobAdapterAbi, functionName: "getJob", args: [freshNode.jobId] })
+          : undefined;
+        const jobContext = effectiveJobContext(freshNode, compensationJob);
         if (details.action === "activate-node" && Number(freshNode.status) !== 1) throw new Error("Node is no longer Ready");
-        if (details.action === "submit-job" && (Number(freshNode.status) !== 2 && Number(freshNode.status) !== 9 || freshNode.provider.toLowerCase() !== account.address.toLowerCase())) throw new Error("The active wallet is not the provider of a funded job");
-        if ((details.action === "complete-job" || details.action === "reject-job" || details.action === "complete-compensation") && (Number(freshNode.status) !== 4 && Number(freshNode.status) !== 9 || details.expectedEvaluator?.toLowerCase() !== account.address.toLowerCase())) throw new Error("The active wallet is not the evaluator of a submitted job");
-        if (details.action === "claim-expiry" && BigInt(nowSeconds()) < freshNode.expiry) throw new Error("The node deadline has not passed");
+        if (details.action === "submit-job") assertJobRole(jobContext, "submit", account.address);
+        if (details.action === "complete-job" || details.action === "reject-job" || details.action === "complete-compensation") assertJobRole(jobContext, "evaluate", account.address);
+        if (details.action === "claim-expiry" && BigInt(nowSeconds()) < jobContext.expiry) throw new Error("The active job deadline has not passed");
         if ((details.action === "expire-compensation" || details.action === "open-compensation" || details.action === "declare-unresolved") && Number(freshNode.status) !== 5 && Number(freshNode.status) !== 9) throw new Error("Compensation is not pending for this node");
         if (details.action === "open-compensation" || details.action === "expire-compensation" || details.action === "declare-unresolved") {
           const freshMask = Number(await publicClient.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "compensationPendingMask" }));
@@ -153,15 +158,17 @@ type NodeValue = ContractFunctionReturnType<typeof workflowCoordinatorAbi, "view
 function NodeCard({ nodeId, node, account, owner, adapter, busy, compensationPending, setDialog, coordinatorAction, claimExpiry }: { nodeId: number; node: NodeValue; account?: Address | undefined; owner: boolean; adapter?: Address | undefined; busy: boolean; compensationPending: boolean; setDialog: (dialog: Dialog) => void; coordinatorAction: (key: string, fn: "activateNode" | "approveNode" | "expireCompensation" | "openNextCompensation", args: readonly unknown[]) => Promise<void>; claimExpiry: (jobId: bigint, nodeId: number) => Promise<void> }) {
   const now = useNowSeconds();
   const compensationJob = useReadContract({ address: adapter, abi: agentJobAdapterAbi, functionName: "getJob", args: [node.jobId], query: { enabled: Boolean(adapter && node.status === 9) } });
-  const provider = node.status === 9 && compensationJob.data ? compensationJob.data.provider : node.provider;
-  const evaluator = node.status === 9 && compensationJob.data ? compensationJob.data.evaluator : node.evaluator;
-  const adapterStatus = node.status === 9 && compensationJob.data ? compensationJob.data.status : undefined;
-  const effectiveBudget = node.status === 9 && compensationJob.data ? compensationJob.data.budget : node.budget;
+  if (node.status === 9 && !compensationJob.data) return <div className="node-editor"><strong>Node {nodeId + 1} · Compensating</strong><p>Loading the active remediation job…</p></div>;
+  const context = effectiveJobContext(node, compensationJob.data);
+  const provider = context.provider;
+  const evaluator = context.evaluator;
+  const adapterStatus = context.jobType === "compensation" ? context.status : undefined;
+  const effectiveBudget = context.budget;
   const isProvider = account?.toLowerCase() === provider.toLowerCase();
   const isEvaluator = account?.toLowerCase() === evaluator.toLowerCase();
   const nodeLabel = nodeStatusLabels[node.status] ?? `Unknown (${node.status})`;
   return <div className="node-editor"><strong>Node {nodeId + 1} · {nodeLabel === "Rejected" && now >= Number(node.expiry) ? "Expired" : nodeLabel}</strong>
-    <dl className="summary-list"><div><dt>Provider</dt><dd><code>{provider}</code></dd></div><div><dt>Evaluator</dt><dd><code>{evaluator}</code></dd></div><div><dt>Budget</dt><dd>{formatUnits(node.budget, 6)} USDC</dd></div><div><dt>Job</dt><dd>{node.jobId.toString()}</dd></div><div><dt>Expiry</dt><dd>{new Date(Number(node.expiry) * 1000).toISOString()}</dd></div></dl>
+    <dl className="summary-list"><div><dt>Provider</dt><dd><code>{provider}</code></dd></div><div><dt>Evaluator</dt><dd><code>{evaluator}</code></dd></div><div><dt>Budget</dt><dd>{formatUnits(context.budget, 6)} USDC</dd></div><div><dt>Job</dt><dd>{context.jobId.toString()}</dd></div><div><dt>Expiry</dt><dd>{new Date(Number(context.expiry) * 1000).toISOString()}</dd></div></dl>
     <div className="action-row">
       {node.status === 1 && <button type="button" disabled={busy} onClick={() => coordinatorAction(`activate-${nodeId}`, "activateNode", [nodeId])}>Activate</button>}
       {owner && node.humanApprovalRequired && !node.humanApproved && (node.status === 0 || node.status === 1) && <button type="button" disabled={busy} onClick={() => coordinatorAction(`approve-${nodeId}`, "approveNode", [nodeId])}>Approve node</button>}

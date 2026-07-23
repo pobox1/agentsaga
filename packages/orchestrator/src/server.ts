@@ -8,8 +8,10 @@ import { prisma, PostgresActionLedger } from "./postgres.js";
 import { QueueRuntime, queueNames, type QueueName } from "./queues.js";
 import { createPublicClient, http } from "viem";
 import { arcTestnet } from "@agentsaga/contracts";
-import { loadRuntimeCapabilities } from "./capabilities.js";
+import { loadCapabilityConfiguration } from "./capabilities.js";
 import { buildReadiness, parseHeartbeat } from "./readiness.js";
+import { checkMigrationReadiness } from "./migration-readiness.js";
+import { publishProcessHeartbeat } from "./runtime-heartbeat.js";
 
 const localScenarioBody = z.object({ failRisk: z.boolean().optional() }).strict();
 const addressParams = z.object({ address: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
@@ -24,9 +26,10 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
   const requests = new Map<string, { count: number; resetAt: number }>();
   const allowedOrigins = new Set(config.CORS_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean));
   const apiTokens = new Set([config.ORCHESTRATOR_API_TOKEN, ...(config.ORCHESTRATOR_API_TOKENS?.split(",") ?? [])].filter((token): token is string => Boolean(token?.trim())).map((token) => token.trim()));
-  const queueRuntime = config.REDIS_URL ? new QueueRuntime(config.REDIS_URL) : undefined;
+  const capabilityConfiguration = loadCapabilityConfiguration(config.OPERATION_MODE, config.RUNTIME_CAPABILITIES_JSON);
+  const queueRuntime = config.REDIS_URL ? new QueueRuntime(config.REDIS_URL, { ...capabilityConfiguration, gitCommit: config.GIT_COMMIT_SHA }) : undefined;
   const arcClient = createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
-  const capabilities = loadRuntimeCapabilities(config.OPERATION_MODE, config.RUNTIME_CAPABILITIES_JSON);
+  const capabilities = capabilityConfiguration.capabilities;
   app.setErrorHandler((error, request, reply) => {
     request.log.error({ err: error, requestId: request.id }, "request failed");
     const failure = error instanceof Error ? error : new Error("Unknown request failure");
@@ -38,8 +41,9 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
   let apiHeartbeat: NodeJS.Timeout | undefined;
   app.addHook("onReady", async () => {
     if (!queueRuntime) return;
-    const publish = () => queueRuntime.connection.set("agentsaga:process:api", JSON.stringify({ processId: process.pid, gitCommit: config.GIT_COMMIT_SHA, timestamp: new Date().toISOString(), mode: config.OPERATION_MODE }), "EX", config.HEARTBEAT_STALE_SECONDS * 2);
-    await publish(); apiHeartbeat = setInterval(() => void publish(), 15_000);
+    const publish = () => publishProcessHeartbeat(queueRuntime.connection, "api", capabilityConfiguration, config.GIT_COMMIT_SHA, config.HEARTBEAT_STALE_SECONDS);
+    await publish();
+    apiHeartbeat = setInterval(() => void publish().catch((error: unknown) => app.log.error({ err: error }, "API heartbeat failed")), 15_000);
   });
   app.addHook("onClose", async () => { if (apiHeartbeat) clearInterval(apiHeartbeat); await queueRuntime?.close(); await prisma.$disconnect(); });
   app.addHook("onRequest", async (request, reply) => {
@@ -79,15 +83,78 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
     const processes = { api: parseHeartbeat(processValues[0] ?? null, config.HEARTBEAT_STALE_SECONDS), worker: parseHeartbeat(processValues[1] ?? null, config.HEARTBEAT_STALE_SECONDS), indexer: parseHeartbeat(processValues[2] ?? null, config.HEARTBEAT_STALE_SECONDS), scheduler: parseHeartbeat(processValues[3] ?? null, config.HEARTBEAT_STALE_SECONDS) };
     const cursor = config.DATABASE_URL && config.WORKFLOW_FACTORY_ADDRESS ? await prisma.chainCursor.findUnique({ where: { id: `arc:${arcTestnet.id}:factory:${config.WORKFLOW_FACTORY_ADDRESS.toLowerCase()}` } }).then((value) => value ? "ready" as const : "missing" as const).catch(() => "unavailable" as const) : "not-configured" as const;
     const deployment = config.WORKFLOW_FACTORY_ADDRESS && config.FACTORY_DEPLOYMENT_BLOCK !== undefined ? "configured" as const : "not-configured" as const;
-    const migrations = config.DATABASE_URL ? await prisma.$queryRaw<Array<{ migration_name: string }>>`SELECT migration_name FROM "_prisma_migrations" WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1`.then((rows) => rows[0]?.migration_name === "202607220003_durable_waiting_capabilities" ? "ready" as const : "missing" as const).catch(() => "unavailable" as const) : "not-configured" as const;
-    const readiness = buildReadiness({ mode: config.OPERATION_MODE, arcRpc, database, redis, deployment: deployment === "configured" ? "ready" : "not-configured", cursor, migrations, processes, processorHeartbeats, capabilities });
+    const migrationDetail = config.DATABASE_URL ? await checkMigrationReadiness(prisma) : undefined;
+    const migrations = migrationDetail?.status ?? "not-configured" as const;
+    const projectionCounts = config.DATABASE_URL
+      ? await Promise.all([
+        prisma.indexedEvent.count({ where: { projectionStatus: { in: ["received", "processing"] } } }),
+        prisma.indexedEvent.count({ where: { projectionStatus: "failed" } }),
+      ]).catch(() => [0, 1])
+      : [0, 0];
+    const [projectionBacklog = 0, failedProjections = 0] = projectionCounts;
+    const readiness = buildReadiness({
+      mode: config.OPERATION_MODE,
+      arcRpc,
+      database,
+      redis,
+      deployment: deployment === "configured" ? "ready" : "not-configured",
+      cursor,
+      migrations,
+      processes,
+      processorHeartbeats,
+      capabilities,
+      expectedConfigVersion: capabilityConfiguration.version,
+      expectedConfigHash: capabilityConfiguration.hash,
+      projectionBacklog,
+      failedProjections,
+    });
     const servingReady = config.OPERATION_MODE === "autonomous" ? readiness.coreReady && readiness.autonomousReady : readiness.coreReady;
-    return reply.code(servingReady ? 200 : 503).send({ ...readiness, arcRpc, database, redis, processes, indexerCursor: cursor, migrations, deployment, circle: config.CIRCLE_INTEGRATION_STATUS, x402: config.X402_INTEGRATION_STATUS });
+    return reply.code(servingReady ? 200 : 503).send({
+      ...readiness,
+      arcRpc,
+      database,
+      redis,
+      processes,
+      indexerCursor: cursor,
+      migrations,
+      migrationDetail,
+      deployment,
+      circle: config.CIRCLE_INTEGRATION_STATUS,
+      x402: config.X402_INTEGRATION_STATUS,
+    });
   });
-  app.get("/metrics", async (_request, reply) => reply.type("text/plain").send([
-    "# HELP agentsaga_up Whether the orchestrator process is up.",
-    "# TYPE agentsaga_up gauge", "agentsaga_up 1", "",
-  ].join("\n")));
+  app.get("/metrics", async (_request, reply) => {
+    const [waiting, failed, deadLetters, projectionBacklog, projectionFailed, recovering] = config.DATABASE_URL
+      ? await Promise.all([
+        prisma.workerAction.count({ where: { status: "waiting" } }),
+        prisma.workerAction.count({ where: { status: { in: ["failed", "dead_lettered", "blocked_permanently"] } } }),
+        prisma.deadLetterRecord.count({ where: { resolvedAt: null } }),
+        prisma.indexedEvent.count({ where: { projectionStatus: { in: ["received", "processing"] } } }),
+        prisma.indexedEvent.count({ where: { projectionStatus: "failed" } }),
+        prisma.chainTransaction.count({ where: { status: { in: ["submitted", "confirming", "recovery_paused"] } } }),
+      ]).catch(() => [0, 0, 0, 0, 0, 0])
+      : [0, 0, 0, 0, 0, 0];
+    const queueCounts = queueRuntime
+      ? await Promise.all(Object.values(queueRuntime.queues).map((queue) => queue.getJobCounts("waiting", "active", "failed", "delayed"))).catch(() => [])
+      : [];
+    const total = (key: "waiting" | "active" | "failed" | "delayed") => queueCounts.reduce((sum, counts) => sum + (counts[key] ?? 0), 0);
+    return reply.type("text/plain").send([
+      "# HELP agentsaga_up Whether the orchestrator API process is up.",
+      "# TYPE agentsaga_up gauge", "agentsaga_up 1",
+      "# TYPE agentsaga_waiting_actions gauge", `agentsaga_waiting_actions ${waiting}`,
+      "# TYPE agentsaga_failed_actions gauge", `agentsaga_failed_actions ${failed}`,
+      "# TYPE agentsaga_dead_letters gauge", `agentsaga_dead_letters ${deadLetters}`,
+      "# TYPE agentsaga_event_projection_backlog gauge", `agentsaga_event_projection_backlog ${projectionBacklog}`,
+      "# TYPE agentsaga_event_projection_failed gauge", `agentsaga_event_projection_failed ${projectionFailed}`,
+      "# TYPE agentsaga_transaction_recovery gauge", `agentsaga_transaction_recovery ${recovering}`,
+      "# TYPE agentsaga_queue_jobs gauge",
+      `agentsaga_queue_jobs{state="waiting"} ${total("waiting")}`,
+      `agentsaga_queue_jobs{state="active"} ${total("active")}`,
+      `agentsaga_queue_jobs{state="failed"} ${total("failed")}`,
+      `agentsaga_queue_jobs{state="delayed"} ${total("delayed")}`,
+      "",
+    ].join("\n"));
+  });
   app.get("/version", async () => ({ service: "agentsaga-orchestrator", commit: config.GIT_COMMIT_SHA }));
   app.get("/v1/workflows/:address", async (request, reply) => {
     const parsed = addressParams.safeParse(request.params); if (!parsed.success) return reply.code(400).send({ error: "invalid_address" });

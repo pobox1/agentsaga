@@ -17,6 +17,7 @@ model ChainCursor {
 
 model IndexedEvent {
   id               String   @id
+  sourceId         String
   chainId          Int
   transactionHash  String
   logIndex         Int
@@ -24,10 +25,18 @@ model IndexedEvent {
   blockHash        String
   eventName        String
   payload          Json
+  projectionStatus String   @default("received")
+  projectionAttempts Int    @default(0)
+  lastProjectionError String?
+  nextProjectionAttemptAt DateTime?
+  processingStartedAt DateTime?
+  processedAt      DateTime?
   createdAt        DateTime @default(now())
 
   @@unique([chainId, transactionHash, logIndex])
   @@index([chainId, blockNumber])
+  @@index([sourceId, projectionStatus, nextProjectionAttemptAt], map: "IndexedEvent_projection_queue_idx")
+  @@index([projectionStatus, nextProjectionAttemptAt])
 }
 
 model WorkerAction {
@@ -101,6 +110,9 @@ model WorkflowJob {
   jobType         String
   provider        String?
   evaluator       String?
+  budget          String?
+  expiry          DateTime?
+  specificationHash String?
   status          String
   createdBlock    BigInt
   state           Json
@@ -117,6 +129,14 @@ model ProcessorCapability {
   status          String
   mode            String
   detail          String?
+  configuredStatus String?
+  dependencyStatus String?
+  signerAvailability String?
+  signerRole      String?
+  adapterAvailability String?
+  operational     Boolean  @default(false)
+  configVersion   String?
+  configHash      String?
   processId       Int?
   gitCommit       String?
   heartbeatAt     DateTime?
@@ -144,6 +164,8 @@ model AgentExecution {
   id              String   @id
   workflowAddress String
   nodeId          Int
+  jobId           String
+  executionType   String
   agentId         String
   status          String
   input           Json
@@ -155,13 +177,16 @@ model AgentExecution {
   completedAt     DateTime?
   workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
 
-  @@index([workflowAddress, nodeId])
+  @@unique([workflowAddress, nodeId, jobId, executionType])
+  @@index([workflowAddress, nodeId, executionType])
 }
 
 model EvaluatorDecision {
   id              String   @id
   workflowAddress String
   nodeId          Int
+  jobId           String
+  executionType   String
   evaluatorId     String
   decision        String
   reasonCode      String
@@ -169,7 +194,8 @@ model EvaluatorDecision {
   evaluatedAt     DateTime
   workflow        Workflow @relation(fields: [workflowAddress], references: [address], onDelete: Cascade)
 
-  @@index([workflowAddress, nodeId])
+  @@unique([workflowAddress, nodeId, jobId, executionType], map: "EvaluatorDecision_job_context_key")
+  @@index([workflowAddress, nodeId, executionType])
 }
 
 model ChainTransaction {
@@ -177,16 +203,24 @@ model ChainTransaction {
   workflowAddress String?
   chainId         Int
   action          String
+  logicalActionKey String?
   status          String
   blockNumber     BigInt?
   fromAddress     String?
   toAddress       String?
+  transactionNonce Int?
+  verificationMethod String?
+  verificationResult Json?
+  lastCheckedAt   DateTime?
+  recoveryAttempts Int @default(0)
+  replacedByHash  String?
   payload         Json
   submittedAt     DateTime
   confirmedAt     DateTime?
   workflow        Workflow? @relation(fields: [workflowAddress], references: [address], onDelete: SetNull)
 
   @@index([workflowAddress, action])
+  @@index([logicalActionKey, status])
 }
 
 model IdempotencyRecord {

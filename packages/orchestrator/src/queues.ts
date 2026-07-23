@@ -1,11 +1,31 @@
 import { createHash } from "node:crypto";
 import { Queue, Worker, type JobsOptions, type Processor } from "bullmq";
 import IORedis from "ioredis";
-import type { CapabilityStatus, OperationMode } from "./capabilities.js";
+import type { CapabilityStatus, OperationMode, RuntimeCapabilityConfiguration } from "./capabilities.js";
 
 export const queueNames = ["index-events", "discover-ready-nodes", "activate-node", "execute-agent", "submit-deliverable", "evaluate-job", "complete-job", "reject-job", "open-compensation", "execute-compensation", "expire-job", "expire-compensation", "expire-workflow", "build-receipt-index", "reconcile-state"] as const;
 export type QueueName = typeof queueNames[number];
 const defaultJobOptions: JobsOptions = { attempts: 7, backoff: { type: "exponential", delay: 2_000 }, removeOnComplete: { age: 86_400, count: 10_000 }, removeOnFail: false };
+export type ProcessorRuntimeFact = {
+  registered: boolean;
+  configuredCapability: CapabilityStatus;
+  dependencyStatus: "ready" | "missing" | "waiting_auth" | "manual" | "unhealthy";
+  signerAvailability?: "ready" | "missing" | "waiting_auth" | "manual" | "disabled";
+  signerRole?: string;
+  adapterAvailability?: "ready" | "missing" | "manual" | "disabled" | "unhealthy";
+  operational: boolean;
+  detail?: string;
+};
+export type RuntimeIdentity = Pick<RuntimeCapabilityConfiguration, "version" | "hash" | "mode"> & { gitCommit: string };
+export type ProcessorHeartbeatDetail = ProcessorRuntimeFact & {
+  fresh: boolean;
+  timestamp?: string;
+  processId?: number;
+  gitCommit?: string;
+  mode?: OperationMode;
+  configVersion?: string;
+  configHash?: string;
+};
 
 export class QueueRuntime {
   readonly connection: IORedis;
@@ -14,8 +34,9 @@ export class QueueRuntime {
   private readonly workers: Worker[] = [];
   private readonly registered = new Set<QueueName>();
   private readonly capabilities = new Map<QueueName, CapabilityStatus>();
+  private factProvider?: () => Promise<Record<QueueName, ProcessorRuntimeFact>>;
   private heartbeat?: NodeJS.Timeout;
-  constructor(redisUrl: string) {
+  constructor(redisUrl: string, private readonly identity?: RuntimeIdentity) {
     this.connection = new IORedis(redisUrl, { maxRetriesPerRequest: null, enableReadyCheck: true });
     this.queues = Object.fromEntries(queueNames.map((name) => [name, new Queue(name, { connection: this.connection, defaultJobOptions })])) as Record<QueueName, Queue>;
     this.deadLetter = new Queue("dead-letter", { connection: this.connection });
@@ -44,6 +65,9 @@ export class QueueRuntime {
     await Promise.all([...Object.values(this.queues), this.deadLetter].map((queue) => queue.close()));
     await this.connection.quit();
   }
+  setProcessorFactProvider(provider: () => Promise<Record<QueueName, ProcessorRuntimeFact>>): void {
+    this.factProvider = provider;
+  }
   registeredProcessors(): QueueName[] { return [...this.registered]; }
   async waitUntilReady(): Promise<void> { await Promise.all(this.workers.map((worker) => worker.waitUntilReady())); }
   async pauseWorkers(): Promise<void> { await Promise.all(this.workers.map((worker) => worker.pause(true))); }
@@ -51,20 +75,39 @@ export class QueueRuntime {
     const details = await this.processorHeartbeatDetails(staleSeconds);
     return Object.fromEntries(queueNames.map((name) => [name, details[name]?.fresh === true])) as Record<QueueName, boolean>;
   }
-  async processorHeartbeatDetails(staleSeconds = 45): Promise<Record<QueueName, { fresh: boolean; timestamp?: string; processId?: number; gitCommit?: string; mode?: OperationMode; capability?: CapabilityStatus }>> {
+  async processorHeartbeatDetails(staleSeconds = 45): Promise<Record<QueueName, ProcessorHeartbeatDetail>> {
     const values = await Promise.all(queueNames.map((name) => this.connection.get(`agentsaga:processor:${name}`)));
     const now = Date.now();
     return Object.fromEntries(queueNames.map((name, index) => {
       try {
-        const value = JSON.parse(values[index] ?? "null") as { timestamp?: string; processId?: number; gitCommit?: string; mode?: OperationMode; capability?: CapabilityStatus } | null;
+        const value = JSON.parse(values[index] ?? "null") as Omit<ProcessorHeartbeatDetail, "fresh"> | null;
         const fresh = Boolean(value?.timestamp && now - Date.parse(value.timestamp) <= staleSeconds * 1_000);
         return [name, { ...(value ?? {}), fresh }];
       } catch { return [name, { fresh: false }]; }
-    })) as Record<QueueName, { fresh: boolean; timestamp?: string; processId?: number; gitCommit?: string; mode?: OperationMode; capability?: CapabilityStatus }>;
+    })) as Record<QueueName, ProcessorHeartbeatDetail>;
   }
-  private async publishProcessorHeartbeat(): Promise<void> {
+  async publishProcessorHeartbeat(): Promise<void> {
     const timestamp = new Date().toISOString();
-    await Promise.all([...this.registered].map((name) => this.connection.set(`agentsaga:processor:${name}`, JSON.stringify({ processId: process.pid, gitCommit: process.env.GIT_COMMIT_SHA ?? "unknown", timestamp, mode: process.env.OPERATION_MODE ?? "manual", capability: this.capabilities.get(name) ?? "not_configured" }), "EX", 90)));
+    const facts = await this.factProvider?.();
+    await Promise.all([...this.registered].map((name) => {
+      const configuredCapability = this.capabilities.get(name) ?? "not_configured";
+      const fact = facts?.[name] ?? {
+        registered: true,
+        configuredCapability,
+        dependencyStatus: "missing" as const,
+        operational: false,
+        detail: "No factual capability provider is attached",
+      };
+      return this.connection.set(`agentsaga:processor:${name}`, JSON.stringify({
+        processId: process.pid,
+        gitCommit: this.identity?.gitCommit ?? process.env.GIT_COMMIT_SHA ?? "unknown",
+        timestamp,
+        mode: this.identity?.mode ?? process.env.OPERATION_MODE ?? "manual",
+        configVersion: this.identity?.version,
+        configHash: this.identity?.hash,
+        ...fact,
+      }), "EX", 90);
+    }));
   }
 }
 

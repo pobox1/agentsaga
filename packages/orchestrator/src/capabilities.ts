@@ -1,13 +1,17 @@
+import { createHash } from "node:crypto";
 import type { QueueName } from "./queues.js";
 
 export type CapabilityStatus = "ready" | "manual" | "waiting_auth" | "not_configured" | "disabled" | "unhealthy";
 export type OperationMode = "manual" | "hybrid" | "autonomous";
 export type RuntimeCapabilities = {
+  workflowOwnerSigner: CapabilityStatus;
   operatorSigner: CapabilityStatus;
   providerSigner: CapabilityStatus;
   evaluatorSigner: CapabilityStatus;
   compensationSigner: CapabilityStatus;
+  compensationEvaluatorSigner: CapabilityStatus;
   circleSigner: CapabilityStatus;
+  permissionlessSigner: CapabilityStatus;
   researchAgent: CapabilityStatus;
   documentAgent: CapabilityStatus;
   riskAgent: CapabilityStatus;
@@ -19,12 +23,23 @@ export type RuntimeCapabilities = {
   externalEvaluator: CapabilityStatus;
 };
 
+export const RUNTIME_CAPABILITY_VERSION = "2";
+export type RuntimeCapabilityConfiguration = {
+  version: string;
+  hash: string;
+  mode: OperationMode;
+  capabilities: RuntimeCapabilities;
+};
+
 export const defaultCapabilities = (mode: OperationMode): RuntimeCapabilities => ({
+  workflowOwnerSigner: mode === "manual" ? "manual" : "not_configured",
   operatorSigner: mode === "manual" ? "manual" : "not_configured",
   providerSigner: mode === "manual" ? "manual" : "not_configured",
   evaluatorSigner: mode === "manual" ? "manual" : "not_configured",
   compensationSigner: mode === "manual" ? "manual" : "not_configured",
+  compensationEvaluatorSigner: mode === "manual" ? "manual" : "not_configured",
   circleSigner: "waiting_auth",
+  permissionlessSigner: mode === "manual" ? "manual" : "not_configured",
   researchAgent: "ready",
   documentAgent: "ready",
   riskAgent: "ready",
@@ -45,23 +60,37 @@ export function loadRuntimeCapabilities(mode: OperationMode, serialized?: string
   return { ...defaults, ...parsed };
 }
 
-const requirements: Record<QueueName, readonly (keyof RuntimeCapabilities)[]> = {
+export function loadCapabilityConfiguration(
+  mode: OperationMode,
+  serialized?: string,
+): RuntimeCapabilityConfiguration {
+  const capabilities = loadRuntimeCapabilities(mode, serialized);
+  const canonical = JSON.stringify({ version: RUNTIME_CAPABILITY_VERSION, mode, capabilities });
+  return {
+    version: RUNTIME_CAPABILITY_VERSION,
+    hash: createHash("sha256").update(canonical).digest("hex"),
+    mode,
+    capabilities,
+  };
+}
+
+export const processorRequirements: Record<QueueName, readonly (keyof RuntimeCapabilities)[]> = {
   "index-events": [], "discover-ready-nodes": [], "reconcile-state": [], "build-receipt-index": [],
   "activate-node": ["operatorSigner"],
   "execute-agent": ["researchAgent"],
-  "submit-deliverable": ["providerSigner"],
+  "submit-deliverable": ["providerSigner", "compensationSigner"],
   "evaluate-job": ["deterministicEvaluator"],
-  "complete-job": ["evaluatorSigner"],
-  "reject-job": ["evaluatorSigner"],
-  "open-compensation": ["operatorSigner"],
+  "complete-job": ["evaluatorSigner", "compensationEvaluatorSigner"],
+  "reject-job": ["evaluatorSigner", "compensationEvaluatorSigner"],
+  "open-compensation": ["workflowOwnerSigner", "compensationSigner", "compensationEvaluatorSigner"],
   "execute-compensation": ["compensationAgent"],
-  "expire-job": ["operatorSigner"],
-  "expire-compensation": ["compensationSigner"],
-  "expire-workflow": ["operatorSigner"],
+  "expire-job": ["permissionlessSigner"],
+  "expire-compensation": ["permissionlessSigner"],
+  "expire-workflow": ["permissionlessSigner"],
 };
 
 export function processorCapability(name: QueueName, capabilities: RuntimeCapabilities): CapabilityStatus {
-  const values = requirements[name].map((key) => capabilities[key]);
+  const values = processorRequirements[name].map((key) => capabilities[key]);
   if (values.length === 0 || values.every((value) => value === "ready")) return "ready";
   if (values.some((value) => value === "unhealthy")) return "unhealthy";
   if (values.some((value) => value === "waiting_auth")) return "waiting_auth";

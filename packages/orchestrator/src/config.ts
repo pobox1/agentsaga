@@ -16,6 +16,8 @@ const schema = z.object({
   GIT_COMMIT_SHA: z.string().default("unknown"),
   OPERATION_MODE: z.enum(["manual", "hybrid", "autonomous"]).default("manual"),
   RUNTIME_CAPABILITIES_JSON: z.string().optional(),
+  SIGNER_CONFIG_JSON: z.string().optional(),
+  ALLOW_ENCRYPTED_LOCAL_SIGNERS: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   HEARTBEAT_STALE_SECONDS: z.coerce.number().int().min(10).max(300).default(45),
   WAITING_SCHEDULER_INTERVAL_MS: z.coerce.number().int().min(250).max(300_000).default(5_000),
   WAITING_ACTION_RETRY_SECONDS: z.coerce.number().int().min(1).max(86_400).default(30),

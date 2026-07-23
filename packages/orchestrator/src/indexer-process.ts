@@ -1,14 +1,17 @@
 import { createPublicClient, http, type Address, type Log } from "viem";
-import { arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowStatusLabels } from "@agentsaga/contracts";
+import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowStatusLabels } from "@agentsaga/contracts";
 import { loadConfig } from "./config.js";
 import { appendTransactionEvent, ArcEventIndexer, decodeTrackedEvent, workflowJobType, workflowStatusUpdate } from "./indexer.js";
 import { PostgresCursorStore, prisma } from "./postgres.js";
 import { Prisma } from "@prisma/client";
 import IORedis from "ioredis";
+import { loadCapabilityConfiguration } from "./capabilities.js";
+import { publishProcessHeartbeat } from "./runtime-heartbeat.js";
 
 const config = loadConfig();
 if (!config.DATABASE_URL || !config.REDIS_URL || !config.WORKFLOW_FACTORY_ADDRESS || config.FACTORY_DEPLOYMENT_BLOCK === undefined) throw new Error("Indexer requires DATABASE_URL, REDIS_URL, WORKFLOW_FACTORY_ADDRESS and FACTORY_DEPLOYMENT_BLOCK");
 const redis = new IORedis(config.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: true });
+const capabilityConfiguration = loadCapabilityConfiguration(config.OPERATION_MODE, config.RUNTIME_CAPABILITIES_JSON);
 const factory = config.WORKFLOW_FACTORY_ADDRESS as Address;
 const rpc = createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
 const workflowIndexers = new Map<string, ArcEventIndexer>();
@@ -36,10 +39,22 @@ async function indexWorkflowLog(workflow: string, log: Log): Promise<void> {
   if (statusUpdate) await prisma.workflow.update({ where: { address: workflow }, data: statusUpdate });
   const nodeId = args.nodeId === undefined ? undefined : Number(args.nodeId);
   if (nodeId !== undefined) await prisma.workflowNode.upsert({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId } }, create: { id: `${workflow}:${nodeId}`, workflowAddress: workflow, nodeId, status: decoded.eventName, jobId: args.jobId === undefined ? null : String(args.jobId), provider: args.provider === undefined ? null : String(args.provider).toLowerCase(), evaluator: args.evaluator === undefined ? null : String(args.evaluator).toLowerCase(), state: payload }, update: { status: decoded.eventName, ...(args.jobId === undefined ? {} : { jobId: String(args.jobId) }), ...(args.provider === undefined ? {} : { provider: String(args.provider).toLowerCase() }), ...(args.evaluator === undefined ? {} : { evaluator: String(args.evaluator).toLowerCase() }), state: payload } });
-  if (nodeId !== undefined && args.jobId !== undefined) await prisma.workflowJob.upsert({ where: { workflowAddress_jobId: { workflowAddress: workflow, jobId: String(args.jobId) } }, create: { id: `${workflow}:${args.jobId}`, workflowAddress: workflow, nodeId, jobId: String(args.jobId), jobType: workflowJobType(decoded.eventName), provider: args.provider === undefined ? null : String(args.provider).toLowerCase(), evaluator: args.evaluator === undefined ? null : String(args.evaluator).toLowerCase(), status: decoded.eventName, createdBlock: log.blockNumber ?? 0n, state: payload }, update: { status: decoded.eventName, state: payload } });
+  if (nodeId !== undefined && args.jobId !== undefined) {
+    const adapter = await rpc.readContract({ address: workflow as Address, abi: workflowCoordinatorAbi, functionName: "jobAdapter" });
+    const job = await rpc.readContract({ address: adapter, abi: agentJobAdapterAbi, functionName: "getJob", args: [BigInt(String(args.jobId))] });
+    await prisma.workflowJob.upsert({
+      where: { workflowAddress_jobId: { workflowAddress: workflow, jobId: String(args.jobId) } },
+      create: { id: `${workflow}:${args.jobId}`, workflowAddress: workflow, nodeId, jobId: String(args.jobId), jobType: workflowJobType(decoded.eventName), provider: job.provider.toLowerCase(), evaluator: job.evaluator.toLowerCase(), budget: job.budget.toString(), expiry: new Date(Number(job.expiredAt) * 1_000), specificationHash: job.specificationHash, status: decoded.eventName, createdBlock: log.blockNumber ?? 0n, state: payload },
+      update: { provider: job.provider.toLowerCase(), evaluator: job.evaluator.toLowerCase(), budget: job.budget.toString(), expiry: new Date(Number(job.expiredAt) * 1_000), specificationHash: job.specificationHash, status: decoded.eventName, state: payload },
+    });
+  }
   if (nodeId === undefined && args.jobId !== undefined) {
     const mappedJob = await prisma.workflowJob.findUnique({ where: { workflowAddress_jobId: { workflowAddress: workflow, jobId: String(args.jobId) } } });
-    if (mappedJob) { await prisma.workflowJob.update({ where: { id: mappedJob.id }, data: { status: decoded.eventName, state: payload } }); await prisma.workflowNode.update({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId: mappedJob.nodeId } }, data: { status: decoded.eventName, state: payload } }); }
+    if (mappedJob) {
+      const job = await rpc.readContract({ address: log.address, abi: agentJobAdapterAbi, functionName: "getJob", args: [BigInt(String(args.jobId))] });
+      await prisma.workflowJob.update({ where: { id: mappedJob.id }, data: { provider: job.provider.toLowerCase(), evaluator: job.evaluator.toLowerCase(), budget: job.budget.toString(), expiry: new Date(Number(job.expiredAt) * 1_000), specificationHash: job.specificationHash, status: decoded.eventName, state: payload } });
+      await prisma.workflowNode.update({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId: mappedJob.nodeId } }, data: { status: decoded.eventName, state: payload } });
+    }
   }
   if (decoded.eventName === "NodeApproved" && nodeId !== undefined) await prisma.workerAction.updateMany({ where: { workflow, nodeId, status: "waiting", waitingReason: "human_approval" }, data: { nextAttemptAt: new Date() } });
   if (decoded.eventName === "WorkflowReceiptFinalized" && config.RECEIPT_REGISTRY_ADDRESS) {
@@ -80,8 +95,18 @@ const receiptIndexer = config.RECEIPT_REGISTRY_ADDRESS ? new ArcEventIndexer({ i
 
 for (const row of await prisma.workflow.findMany({ select: { address: true, createdBlock: true } })) await addWorkflow(row.address as Address, row.createdBlock);
 let stopping = false;
-const close = async () => { stopping = true; await redis.quit(); await prisma.$disconnect(); process.exit(0); };
+const close = async () => { stopping = true; await redis.quit(); await prisma.$disconnect(); };
 process.once("SIGINT", () => void close()); process.once("SIGTERM", () => void close());
-while (!stopping) { await redis.set("agentsaga:process:indexer", JSON.stringify({ processId: process.pid, gitCommit: config.GIT_COMMIT_SHA, timestamp: new Date().toISOString(), mode: config.OPERATION_MODE }), "EX", config.HEARTBEAT_STALE_SECONDS * 2); await factoryIndexer.syncOnce(); for (const indexer of workflowIndexers.values()) await indexer.syncOnce(); await receiptIndexer?.syncOnce(); await new Promise((resolve) => setTimeout(resolve, 5_000)); }
+while (!stopping) {
+  try {
+    await factoryIndexer.syncOnce();
+    for (const indexer of workflowIndexers.values()) await indexer.syncOnce();
+    await receiptIndexer?.syncOnce();
+    await publishProcessHeartbeat(redis, "indexer", capabilityConfiguration, config.GIT_COMMIT_SHA, config.HEARTBEAT_STALE_SECONDS);
+  } catch (error) {
+    process.stderr.write(`Indexer cycle failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5_000));
+}
 
 function jsonValue(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Prisma.InputJsonValue; }

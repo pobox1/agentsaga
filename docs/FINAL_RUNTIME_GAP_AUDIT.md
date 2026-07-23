@@ -32,6 +32,29 @@ Starting SHA: `a5f832fbf35a45a31d18b8cf0e706d3dc33e1cc6`.
 
 The deployment manifest remains `not-deployed`. No Arc Testnet deployment, transaction, live PostgreSQL/Redis status, Circle wallet activity, x402 payment, or public production availability is claimed.
 
+## Second post-review blockers
+
+Starting SHA: `c57fed8bb631ab1011bb726299e42a60680a9f55`.
+
+- **Resolved locally:** migration readiness discovers every repository migration dynamically and rejects missing, failed, unfinished, or rolled-back applications; it has no historical migration-name constant.
+- **Resolved locally:** the worker bootstraps validated, role-separated `disabled`, `manual`, encrypted-local testnet, Circle, and named external signer adapters, with no plaintext-key environment variable.
+- **Resolved locally:** API, worker, indexer, and scheduler consume the shared validated capability configuration and publish a compatible version/hash.
+- **Resolved locally:** autonomous readiness uses factual worker processor, dependency, signer, and adapter status; a configured declaration alone cannot make a processor operational.
+- **Resolved locally:** backend writes persist the returned hash atomically before nullable nonce enrichment, recover existing hashes, and record confirming, paused-recovery, revert, and verification outcomes without implicit replacement.
+- **Resolved locally:** service and remediation jobs/executions have separate context and idempotency; compensation uses the active adapter job and action-specific state predicates.
+- **Resolved locally:** frontend compensation cards and preflight derive provider, evaluator, budget, expiry, and status from the active remediation job.
+- **Resolved locally:** raw event ingestion is durable and idempotent while projection has received/processing/processed/failed states, retry metadata, and restart-safe replay.
+- **Resolved locally:** forward-only migrations `202607230005_runtime_truth_and_projection_retry` and `202607230006_stable_index_names` apply cleanly and produce no datamodel drift on the local PostgreSQL 16 test database.
+- **Resolved locally:** the automatic success and failure/compensation tests keep real BullMQ workers active and do not directly invoke processors for lifecycle stages.
+- **Resolved locally:** processes validate configuration, publish shared runtime heartbeats, surface heartbeat failures, and close workers, Redis, and Prisma gracefully.
+- **Resolved locally:** waiting prerequisites preserve execution attempts; resume sequence and execution attempt produce fresh BullMQ attempt IDs, and concurrent scheduler claims remain idempotent.
+- **Resolved locally:** write processors use explicit action-specific fresh-chain predicates rather than generic numeric status ordering.
+- **Resolved locally:** expiry remains distinct from evaluator rejection, `WorkflowStatusChanged` remains authoritative, and reconciliation reads canonical Arc state.
+- **Resolved locally:** `/ready` and `/metrics` expose migration, factual capability, signer-role availability, adapter, projection backlog/failure, queue, dead-letter, process, and recovery signals without addresses or secrets.
+- **Preserved truthfully:** `deployments/arc-testnet.json` remains `not-deployed`; no production, Circle, x402, Vercel, address, or transaction evidence is claimed.
+
+Local evidence on 2026-07-23: orchestrator unit tests 32 passed with 5 integration-gated tests skipped; web tests 41 passed; the separately enabled PostgreSQL 16 + Redis 7 + Anvil 5042002 suite passed all 5 tests, including automatic success, automatic five-node failure/reverse compensation with distinct remediation roles, hash-first worker restart recovery without resend, concurrent scheduler claims, and projection retry after durable ingestion. Remote CI evidence is recorded only after the pushed commit's workflow completes.
+
 This audit uses only these classifications:
 
 - **verified and working**
