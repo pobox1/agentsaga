@@ -1,16 +1,20 @@
 import { randomUUID } from "node:crypto";
 import type { PrismaClient, WorkerAction } from "@prisma/client";
 import type { QueueName, QueueRuntime } from "./queues.js";
+import { PostgresQueueOutbox, stagedActionFromRecord } from "./queue-outbox.js";
 
 export type ActionRequirementCheck = (action: WorkerAction) => Promise<boolean>;
+type QueueOutboxPort = Pick<PostgresQueueOutbox, "stage" | "dispatchPending">;
 
 export class WaitingActionScheduler {
+  private readonly outbox: QueueOutboxPort;
   constructor(
     private readonly db: PrismaClient,
     private readonly queues: QueueRuntime,
     private readonly stillRequired: ActionRequirementCheck = async () => true,
     private readonly leaseSeconds = 30,
-  ) {}
+    outbox?: QueueOutboxPort,
+  ) { this.outbox = outbox ?? new PostgresQueueOutbox(db, queues); }
 
   async runOnce(limit = 50): Promise<number> {
     const owner = `${process.pid}:${randomUUID()}`;
@@ -39,10 +43,11 @@ export class WaitingActionScheduler {
         continue;
       }
       const resumeSequence = action.resumeSequence + 1;
-      await this.queues.enqueue(action.action as QueueName, action.idempotencyKey, action.payload, { actionId: action.id, resumeSequence, executionAttempt: action.executionAttempts });
-      await this.db.workerAction.update({ where: { id: action.id }, data: { status: "queued", resumeAttempts: { increment: 1 }, resumeSequence, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null } });
+      await this.outbox.stage(stagedActionFromRecord(action, resumeSequence));
+      await this.db.workerAction.update({ where: { id: action.id }, data: { resumeAttempts: { increment: 1 } } });
       scheduled++;
     }
+    await this.outbox.dispatchPending(limit);
     return scheduled;
   }
 

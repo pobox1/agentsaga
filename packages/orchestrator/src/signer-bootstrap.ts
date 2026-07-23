@@ -74,8 +74,15 @@ export async function bootstrapSigners(input: {
   }
   if (input.config.OPERATION_MODE === "autonomous") {
     const required: SignerRole[] = ["workflow-owner", "operator", "provider", "evaluator", "compensation-provider", "compensation-evaluator", "permissionless-executor"];
-    const missing = required.filter((requiredRole) => (result.roles[requiredRole]?.ready ?? 0) === 0);
-    if (missing.length) throw new Error(`Autonomous signer bootstrap missing ready roles: ${missing.join(", ")}`);
+    const workflows = [...new Set(parsed.signers.map((entry) => entry.workflow.toLowerCase() as Address))];
+    if (workflows.length === 0) throw new Error("Autonomous signer bootstrap has no workflow-scoped signer configuration");
+    const missing: string[] = [];
+    for (const workflow of workflows) {
+      for (const requiredRole of required) {
+        if (!(await registry.scopeReady({ workflow, role: requiredRole }))) missing.push(`${workflow}:${requiredRole}`);
+      }
+    }
+    if (missing.length) throw new Error(`Autonomous signer bootstrap missing ready scopes: ${missing.join(", ")}`);
   }
   return { registry, result };
 }

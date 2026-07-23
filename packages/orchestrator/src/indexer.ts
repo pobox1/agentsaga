@@ -7,7 +7,9 @@ import {
   type Log,
   type PublicClient,
 } from "viem";
+import { randomUUID } from "node:crypto";
 import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi, workflowStatusLabels } from "@agentsaga/contracts";
+import type { PrismaClient } from "@prisma/client";
 
 export const trackedEventNames = ["WorkflowCreated", "WorkflowFunded", "WorkflowStatusChanged", "NodeReady", "NodeApproved", "NodeActivated", "NodeSubmitted", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationPlanned", "CompensationJobOpened", "CompensationCompleted", "CompensationUnresolved", "Refunded", "JobCreated", "JobFunded", "JobSubmitted", "JobCompleted", "JobRejected", "JobExpired", "WorkflowReceiptFinalized"] as const;
 const trackedNames = new Set<string>(trackedEventNames);
@@ -26,14 +28,14 @@ export interface CursorStore {
   save(id: string, cursor: BlockCursor): Promise<void>;
   putLogIfAbsent(id: string, log: Log, decoded?: DecodedIndexedEvent): Promise<boolean>;
   loadPendingLogs(id: string, limit?: number): Promise<Array<{ id: string; log: Log }>>;
-  claimProjection(eventId: string): Promise<boolean>;
-  markProjectionProcessed(eventId: string): Promise<void>;
-  markProjectionFailed(eventId: string, error: string): Promise<void>;
+  claimProjection(eventId: string, leaseOwner: string, leaseSeconds?: number): Promise<boolean>;
+  markProjectionProcessed(eventId: string, leaseOwner: string): Promise<void>;
+  markProjectionFailed(eventId: string, leaseOwner: string, error: string): Promise<void>;
 }
 
 export class InMemoryCursorStore implements CursorStore {
   private readonly cursors = new Map<string, BlockCursor>();
-  private readonly logs = new Map<string, { sourceId: string; log: Log; status: "received" | "processing" | "processed" | "failed"; nextAttemptAt?: number; attempts: number }>();
+  private readonly logs = new Map<string, { sourceId: string; log: Log; status: "received" | "processing" | "processed" | "failed"; nextAttemptAt?: number; leaseOwner?: string; leaseExpiresAt?: number; attempts: number }>();
 
   async load(id: string): Promise<BlockCursor | undefined> {
     return this.cursors.get(id);
@@ -51,24 +53,37 @@ export class InMemoryCursorStore implements CursorStore {
   }
   async loadPendingLogs(id: string, limit = 100): Promise<Array<{ id: string; log: Log }>> {
     const now = Date.now();
-    return [...this.logs.entries()]
-      .filter(([, value]) => value.sourceId === id && (value.status === "received" || value.status === "failed") && (value.nextAttemptAt ?? 0) <= now)
-      .slice(0, limit)
-      .map(([eventId, value]) => ({ id: eventId, log: value.log }));
+    const ordered = [...this.logs.entries()]
+      .filter(([, value]) => value.sourceId === id && value.status !== "processed")
+      .sort(([, left], [, right]) => Number((left.log.blockNumber ?? 0n) - (right.log.blockNumber ?? 0n)) || (left.log.logIndex ?? 0) - (right.log.logIndex ?? 0));
+    const head = ordered[0];
+    if (!head) return [];
+    const [eventId, value] = head;
+    const claimable = value.status === "received"
+      || value.status === "failed" && (value.nextAttemptAt ?? 0) <= now
+      || value.status === "processing" && (value.leaseExpiresAt ?? 0) <= now;
+    return claimable && limit > 0 ? [{ id: eventId, log: value.log }] : [];
   }
-  async claimProjection(eventId: string): Promise<boolean> {
+  async claimProjection(eventId: string, leaseOwner: string, leaseSeconds = 30): Promise<boolean> {
     const item = this.logs.get(eventId);
-    if (!item || !["received", "failed"].includes(item.status)) return false;
+    const now = Date.now();
+    if (!item || !(item.status === "received"
+      || item.status === "failed" && (item.nextAttemptAt ?? 0) <= now
+      || item.status === "processing" && (item.leaseExpiresAt ?? 0) <= now)) return false;
     item.status = "processing";
+    item.leaseOwner = leaseOwner;
+    item.leaseExpiresAt = now + leaseSeconds * 1_000;
     return true;
   }
-  async markProjectionProcessed(eventId: string): Promise<void> {
-    const item = this.logs.get(eventId); if (item) item.status = "processed";
+  async markProjectionProcessed(eventId: string, leaseOwner: string): Promise<void> {
+    const item = this.logs.get(eventId); if (item?.leaseOwner === leaseOwner) { item.status = "processed"; delete item.leaseOwner; delete item.leaseExpiresAt; }
   }
-  async markProjectionFailed(eventId: string): Promise<void> {
+  async markProjectionFailed(eventId: string, leaseOwner: string): Promise<void> {
     const item = this.logs.get(eventId);
-    if (item) {
+    if (item?.leaseOwner === leaseOwner) {
       item.status = "failed";
+      delete item.leaseOwner;
+      delete item.leaseExpiresAt;
       item.attempts++;
       item.nextAttemptAt = Date.now();
     }
@@ -154,17 +169,20 @@ export async function projectPendingEvents(
   sourceId: string,
   onLog: (log: Log) => Promise<void>,
 ): Promise<number> {
-  const pending = await store.loadPendingLogs(sourceId);
+  const leaseOwner = `${process.pid}:${randomUUID()}`;
   let processed = 0;
-  for (const event of pending) {
-    if (!(await store.claimProjection(event.id))) continue;
+  for (let index = 0; index < 100; index++) {
+    const [event] = await store.loadPendingLogs(sourceId, 1);
+    if (!event) break;
+    if (!(await store.claimProjection(event.id, leaseOwner))) break;
     try {
       await onLog(event.log);
-      await store.markProjectionProcessed(event.id);
+      await store.markProjectionProcessed(event.id, leaseOwner);
       processed++;
     } catch (error) {
       const message = (error instanceof Error ? error.message : "unknown projection error").slice(0, 2_000);
-      await store.markProjectionFailed(event.id, message);
+      await store.markProjectionFailed(event.id, leaseOwner, message);
+      break;
     }
   }
   return processed;
@@ -185,3 +203,27 @@ export function appendTransactionEvent(existing: unknown, event: { eventName: st
 }
 
 export function workflowJobType(eventName: string): "service" | "compensation" { return eventName === "CompensationJobOpened" ? "compensation" : "service"; }
+
+export async function resumeWaitingActionsForProjectedEvent(
+  db: PrismaClient,
+  workflow: string,
+  eventName: string,
+  nodeId?: number,
+): Promise<number> {
+  const reasons = eventName === "NodeApproved"
+    ? ["human_approval"]
+    : ["WorkflowFunded", "WorkflowStatusChanged", "NodeActivated", "NodeCompleted", "NodeRejected", "NodeSkipped", "CompensationCompleted", "CompensationUnresolved", "Refunded"].includes(eventName)
+      ? ["workflow_state", "upstream_artifact"]
+      : [];
+  if (reasons.length === 0) return 0;
+  const result = await db.workerAction.updateMany({
+    where: {
+      workflow: workflow.toLowerCase(),
+      status: "waiting",
+      waitingReason: { in: reasons },
+      ...(nodeId === undefined ? {} : { nodeId }),
+    },
+    data: { nextAttemptAt: new Date() },
+  });
+  return result.count;
+}

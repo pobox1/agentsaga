@@ -45,6 +45,15 @@ export class SignerRegistry {
     return Object.fromEntries(facts) as Record<SignerRole, SignerFact>;
   }
   async roleReady(role: SignerRole): Promise<boolean> { return (await this.facts())[role].ready; }
+  async scopeReady(scope: Omit<SignerScope, "expectedAddress">): Promise<boolean> {
+    const entry = this.entries.get(this.key(scope)) ?? this.entries.get(this.key({ workflow: scope.workflow, role: scope.role }));
+    return Boolean(entry && await entry.signer.status() === "ready");
+  }
+  async coverage(scopes: ReadonlyArray<Omit<SignerScope, "expectedAddress">>): Promise<{ required: number; covered: number; missing: Array<Omit<SignerScope, "expectedAddress">> }> {
+    const missing: Array<Omit<SignerScope, "expectedAddress">> = [];
+    for (const scope of scopes) if (!(await this.scopeReady(scope))) missing.push(scope);
+    return { required: scopes.length, covered: scopes.length - missing.length, missing };
+  }
   async addressFor(scope: Omit<SignerScope, "expectedAddress">): Promise<Address | undefined> {
     const entry = this.entries.get(this.key(scope)) ?? this.entries.get(this.key({ workflow: scope.workflow, role: scope.role }));
     if (!entry || await entry.signer.status() !== "ready") return undefined;

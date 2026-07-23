@@ -1,7 +1,7 @@
 import { createPublicClient, http, type Address, type Log } from "viem";
 import { agentJobAdapterAbi, arcTestnet, receiptRegistryAbi, workflowCoordinatorAbi, workflowStatusLabels } from "@agentsaga/contracts";
 import { loadConfig } from "./config.js";
-import { appendTransactionEvent, ArcEventIndexer, decodeTrackedEvent, workflowJobType, workflowStatusUpdate } from "./indexer.js";
+import { appendTransactionEvent, ArcEventIndexer, decodeTrackedEvent, resumeWaitingActionsForProjectedEvent, workflowJobType, workflowStatusUpdate } from "./indexer.js";
 import { PostgresCursorStore, prisma } from "./postgres.js";
 import { Prisma } from "@prisma/client";
 import IORedis from "ioredis";
@@ -56,7 +56,7 @@ async function indexWorkflowLog(workflow: string, log: Log): Promise<void> {
       await prisma.workflowNode.update({ where: { workflowAddress_nodeId: { workflowAddress: workflow, nodeId: mappedJob.nodeId } }, data: { status: decoded.eventName, state: payload } });
     }
   }
-  if (decoded.eventName === "NodeApproved" && nodeId !== undefined) await prisma.workerAction.updateMany({ where: { workflow, nodeId, status: "waiting", waitingReason: "human_approval" }, data: { nextAttemptAt: new Date() } });
+  await resumeWaitingActionsForProjectedEvent(prisma, workflow, decoded.eventName, nodeId);
   if (decoded.eventName === "WorkflowReceiptFinalized" && config.RECEIPT_REGISTRY_ADDRESS) {
     const receipt = await rpc.readContract({ address: config.RECEIPT_REGISTRY_ADDRESS as Address, abi: receiptRegistryAbi, functionName: "getReceipt", args: [workflow as Address] });
     await prisma.evidenceRecord.upsert({ where: { id: `${workflow}:receipt` }, create: { id: `${workflow}:receipt`, workflowAddress: workflow, kind: "workflow-receipt", commitment: String(args.evidenceAccumulator ?? log.transactionHash), transactionHash: log.transactionHash, metadata: jsonValue(receipt) }, update: { transactionHash: log.transactionHash, metadata: jsonValue(receipt) } });
@@ -90,7 +90,10 @@ const receiptIndexer = config.RECEIPT_REGISTRY_ADDRESS ? new ArcEventIndexer({ i
   const decoded = decodeTrackedEvent(log); if (decoded?.eventName !== "WorkflowReceiptFinalized") return;
   const args = decoded.payload.args as Record<string, unknown>; if (typeof args.workflow !== "string") return;
   const workflow = args.workflow.toLowerCase();
-  if (await prisma.workflow.findUnique({ where: { address: workflow } })) await indexWorkflowLog(workflow, log);
+  if (!(await prisma.workflow.findUnique({ where: { address: workflow } }))) {
+    throw new Error(`Receipt projection dependency is not ready: workflow ${workflow} has not been projected`);
+  }
+  await indexWorkflowLog(workflow, log);
 }) : undefined;
 
 for (const row of await prisma.workflow.findMany({ select: { address: true, createdBlock: true } })) await addWorkflow(row.address as Address, row.createdBlock);

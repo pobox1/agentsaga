@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPublicClient, createWalletClient, encodeFunctionData, http, keccak256, stringToHex, type Abi, type Address, type Hash } from "viem";
 import { arcTestnet, policyRegistryAbi, workflowCoordinatorAbi, workflowFactoryAbi } from "@agentsaga/contracts";
@@ -14,8 +15,9 @@ import { WaitingActionScheduler } from "./waiting-action-scheduler.js";
 import type { Job } from "bullmq";
 import { createDemoAgents } from "./agents.js";
 import { PostgresCursorStore } from "./postgres.js";
-import { projectPendingEvents } from "./indexer.js";
+import { projectPendingEvents, resumeWaitingActionsForProjectedEvent } from "./indexer.js";
 import type { Log } from "viem";
+import { PostgresQueueOutbox } from "./queue-outbox.js";
 
 const integration = process.env.RUN_INTEGRATION === "1" ? describe : describe.skip;
 const rpcUrl = process.env.ANVIL_RPC_URL ?? "http://127.0.0.1:8545";
@@ -43,7 +45,7 @@ integration("PostgreSQL + Redis + Anvil lifecycle", () => {
     await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: usdc, abi: mockAbi, functionName: "mint", args: [account, 100_000_000n] }) });
     await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: usdc, abi: mockAbi, functionName: "approve", args: [workflow, 100_000_000n] }) });
     await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "fund" }) });
-    await prisma.$transaction([prisma.deadLetterRecord.deleteMany(), prisma.workerAction.deleteMany(), prisma.evaluatorDecision.deleteMany(), prisma.agentExecution.deleteMany(), prisma.workflowJob.deleteMany(), prisma.workflowNode.deleteMany(), prisma.chainTransaction.deleteMany(), prisma.evidenceRecord.deleteMany(), prisma.workflow.deleteMany()]);
+    await prisma.$transaction([prisma.queueOutbox.deleteMany(), prisma.transactionIntent.deleteMany(), prisma.deadLetterRecord.deleteMany(), prisma.workerAction.deleteMany(), prisma.evaluatorDecision.deleteMany(), prisma.agentExecution.deleteMany(), prisma.workflowJob.deleteMany(), prisma.workflowNode.deleteMany(), prisma.chainTransaction.deleteMany(), prisma.evidenceRecord.deleteMany(), prisma.workflow.deleteMany()]);
     await prisma.workflow.create({ data: { address: workflow.toLowerCase(), chainId: arcTestnet.id, owner: account.toLowerCase(), paymentToken: usdc.toLowerCase(), status: "Active", statusCode: 2, statusLabel: "Active", totalBudget: "100000000", nodeCount: 1, createdBlock: createReceipt.blockNumber, state: {} } });
     signer = { address: async () => account, status: async () => "ready", sendContractTransaction: async (request: ContractWriteRequest): Promise<Hash> => wallet.sendTransaction({ account, chain: arcTestnet, to: request.address, data: encodeFunctionData({ abi: request.abi, functionName: request.functionName, args: request.args }) }) };
     signers = new SignerRegistry();
@@ -79,6 +81,20 @@ integration("PostgreSQL + Redis + Anvil lifecycle", () => {
     expect(await prisma.deadLetterRecord.count()).toBe(0);
     const activation = actions.find((action) => action.action === "activate-node"); expect(activation).toMatchObject({ executionAttempts: 0, resumeAttempts: 2, status: "completed" });
   }, 40_000);
+
+  it("reconstructs the next queue action when a terminal artifact survived but its continuation did not", async () => {
+    const executionAction = await prisma.workerAction.findFirstOrThrow({ where: { workflow: workflow.toLowerCase(), action: "execute-agent" } });
+    const submitAction = await prisma.workerAction.findFirstOrThrow({ where: { workflow: workflow.toLowerCase(), action: "submit-deliverable" } });
+    await prisma.queueOutbox.deleteMany({ where: { actionId: submitAction.id } });
+    await prisma.workerAction.delete({ where: { id: submitAction.id } });
+    await queues.enqueue("execute-agent", executionAction.idempotencyKey, executionAction.payload, {
+      actionId: executionAction.id,
+      resumeSequence: executionAction.resumeSequence + 1,
+      executionAttempt: executionAction.executionAttempts,
+    });
+    await expect.poll(async () => prisma.workerAction.findFirst({ where: { workflow: workflow.toLowerCase(), action: "submit-deliverable" } }).then((action) => action?.status ?? ""), { timeout: 10_000 }).toMatch(/^(queued|completed|already_complete)$/);
+    expect(await prisma.queueOutbox.count({ where: { idempotencyKey: { contains: "submit-deliverable" } } })).toBeGreaterThan(0);
+  }, 20_000);
 
   it("survives scheduler restart and concurrent claims without duplicate execution", async () => {
     const idempotencyKey = `${workflow}:restart-reconcile`;
@@ -217,6 +233,46 @@ integration("PostgreSQL + Redis + Anvil lifecycle", () => {
     }
   }, 60_000);
 
+  it("persists a pre-broadcast intent and pauses rather than resending an unknown broadcast", async () => {
+    const now = Number((await publicClient.getBlock()).timestamp);
+    const nodes = [{ provider: account, evaluator: account, budget: 10_000_000n, compensationBudget: 0n, expiry: now + 86_400, dependencyMask: 0, specificationHash: keccak256(stringToHex("unknown-broadcast-node")), compensationSpecificationHash: `0x${"00".repeat(32)}`, compensationType: 0, humanApprovalRequired: false, metadataURI: "urn:agentsaga:unknown-broadcast" }];
+    const createTx = await wallet.writeContract({ address: factory, abi: workflowFactoryAbi, functionName: "createWorkflow", args: [usdc, 10_000_000n, 0n, now + 172_800, keccak256(stringToHex("unknown-broadcast-dag")), "urn:agentsaga:unknown-broadcast", keccak256(stringToHex("unknown-broadcast-salt")), nodes] });
+    const createReceipt = await publicClient.waitForTransactionReceipt({ hash: createTx });
+    const unknownWorkflow = await publicClient.readContract({ address: factory, abi: workflowFactoryAbi, functionName: "workflowById", args: [3n] });
+    await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: usdc, abi: mockAbi, functionName: "mint", args: [account, 10_000_000n] }) });
+    await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: usdc, abi: mockAbi, functionName: "approve", args: [unknownWorkflow, 10_000_000n] }) });
+    await publicClient.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: unknownWorkflow, abi: workflowCoordinatorAbi, functionName: "fund" }) });
+    await prisma.workflow.create({ data: { address: unknownWorkflow.toLowerCase(), chainId: arcTestnet.id, owner: account.toLowerCase(), paymentToken: usdc.toLowerCase(), status: "Active", statusCode: 2, statusLabel: "Active", totalBudget: "10000000", nodeCount: 1, createdBlock: createReceipt.blockNumber, state: {} } });
+    let sendCount = 0;
+    const uncertainSigner: TransactionSigner = {
+      address: async () => account,
+      status: async () => "ready",
+      sendContractTransaction: async (request: ContractWriteRequest): Promise<Hash> => {
+        sendCount++;
+        await wallet.sendTransaction({ account, chain: arcTestnet, to: request.address, data: encodeFunctionData({ abi: request.abi, functionName: request.functionName, args: request.args }) });
+        throw new Error("transport disconnected after broadcast");
+      },
+    };
+    const uncertainSigners = new SignerRegistry();
+    for (const role of ["workflow-owner", "operator", "provider", "evaluator", "compensation-provider", "compensation-evaluator", "permissionless-executor"] as const) await uncertainSigners.register({ workflow: unknownWorkflow, role }, uncertainSigner);
+    const uncertainRedis = `${process.env.REDIS_URL}/4`;
+    const uncertainQueues = new QueueRuntime(uncertainRedis);
+    await uncertainQueues.connection.flushdb();
+    const capabilities = defaultCapabilities("autonomous"); for (const key of Object.keys(capabilities) as Array<keyof typeof capabilities>) capabilities[key] = "ready";
+    const uncertainRuntime = new WorkerRuntime(uncertainQueues, loadConfig({ NODE_ENV: "test", ARC_TESTNET_RPC_URL: rpcUrl, DATABASE_URL: process.env.DATABASE_URL, REDIS_URL: uncertainRedis, OPERATION_MODE: "autonomous", RECEIPT_REGISTRY_ADDRESS: receiptRegistry }), uncertainSigners, capabilities);
+    uncertainRuntime.registerAll();
+    await uncertainQueues.waitUntilReady();
+    try {
+      await uncertainQueues.enqueue("discover-ready-nodes", `${unknownWorkflow}:discover`, { workflow: unknownWorkflow });
+      await expect.poll(async () => prisma.transactionIntent.findFirst({ where: { workflowAddress: unknownWorkflow.toLowerCase(), action: "activate-node" } }).then((intent) => intent?.status), { timeout: 20_000 }).toBe("broadcast_unknown");
+      await expect.poll(async () => prisma.workerAction.findFirst({ where: { workflow: unknownWorkflow.toLowerCase(), action: "activate-node" } }).then((action) => action?.waitingReason), { timeout: 20_000 }).toBe("external_service");
+      expect(sendCount).toBe(1);
+      expect(await prisma.chainTransaction.count({ where: { workflowAddress: unknownWorkflow.toLowerCase(), action: "activate-node" } })).toBe(0);
+    } finally {
+      await uncertainQueues.close();
+    }
+  }, 60_000);
+
   it("retries failed PostgreSQL event projections after restart-safe raw ingestion", async () => {
     const sourceId = `integration:projection-retry:${process.pid}:${Date.now()}`;
     const store = new PostgresCursorStore(arcTestnet.id, prisma);
@@ -250,4 +306,54 @@ integration("PostgreSQL + Redis + Anvil lifecycle", () => {
     expect(await projectPendingEvents(store, sourceId, projection)).toBe(1);
     expect(await prisma.indexedEvent.findUniqueOrThrow({ where: { id: failed.id } })).toMatchObject({ projectionStatus: "processed", lastProjectionError: null });
   });
+
+  it("carries a projected approval through PostgreSQL outbox into the scheduler queue and repairs an orphan", async () => {
+    const bridgeRedis = `${process.env.REDIS_URL}/3`;
+    const bridgeQueues = new QueueRuntime(bridgeRedis);
+    await bridgeQueues.connection.flushdb();
+    const bridgeOutbox = new PostgresQueueOutbox(prisma, bridgeQueues);
+    const bridgeWorkflow = "0x9999999999999999999999999999999999999999";
+    const actionId = `indexer-scheduler-${Date.now()}`;
+    const idempotencyKey = `${bridgeWorkflow}:0:activate-node`;
+    const sourceId = `integration:indexer-scheduler:${Date.now()}`;
+    const store = new PostgresCursorStore(arcTestnet.id, prisma);
+    const log = {
+      address: bridgeWorkflow,
+      topics: [],
+      data: "0x",
+      transactionHash: keccak256(stringToHex(sourceId)),
+      transactionIndex: 0,
+      blockHash: keccak256(stringToHex(`${sourceId}:block`)),
+      blockNumber: 2_000n,
+      logIndex: 0,
+      removed: false,
+    } as Log;
+    await prisma.workerAction.create({ data: { id: actionId, workflow: bridgeWorkflow, nodeId: 0, action: "activate-node", idempotencyKey, status: "waiting", waitingReason: "human_approval", payload: { workflow: bridgeWorkflow, nodeId: 0 } } });
+    await store.putLogIfAbsent(sourceId, log);
+    expect(await projectPendingEvents(store, sourceId, async () => {
+      expect(await resumeWaitingActionsForProjectedEvent(prisma, bridgeWorkflow, "NodeApproved", 0)).toBe(1);
+    })).toBe(1);
+    const scheduler = new WaitingActionScheduler(prisma, bridgeQueues);
+    expect(await scheduler.runOnce()).toBe(1);
+    const queued = await prisma.workerAction.findUniqueOrThrow({ where: { id: actionId } });
+    expect(queued).toMatchObject({ status: "queued", resumeSequence: 1 });
+    expect(await prisma.queueOutbox.findFirst({ where: { actionId, status: "published" } })).not.toBeNull();
+    expect(await bridgeQueues.queues["activate-node"].getJob(queued.id)).toBeUndefined();
+    expect(await bridgeQueues.queues["activate-node"].getJob(
+      createHash("sha256").update(`${actionId}:1:0`).digest("hex"),
+    )).not.toBeNull();
+    const publishedOutbox = await prisma.queueOutbox.findFirstOrThrow({ where: { actionId, resumeSequence: 1 } });
+    await prisma.queueOutbox.update({ where: { id: publishedOutbox.id }, data: { status: "publishing", leaseOwner: "crashed-publisher", leaseExpiresAt: new Date(0) } });
+    expect(await bridgeOutbox.dispatchPending()).toBeGreaterThanOrEqual(1);
+    expect(await prisma.queueOutbox.findUniqueOrThrow({ where: { id: publishedOutbox.id } })).toMatchObject({ status: "published", leaseOwner: null });
+
+    await bridgeQueues.queues["activate-node"].obliterate({ force: true });
+    expect(await bridgeOutbox.reconcileOrphanedQueuedActions()).toBeGreaterThanOrEqual(1);
+    expect(await bridgeOutbox.dispatchPending()).toBeGreaterThanOrEqual(1);
+    const repaired = await prisma.workerAction.findUniqueOrThrow({ where: { id: actionId } });
+    expect(await bridgeQueues.queues["activate-node"].getJob(
+      createHash("sha256").update(`${actionId}:${repaired.resumeSequence}:0`).digest("hex"),
+    )).not.toBeNull();
+    await bridgeQueues.close();
+  }, 30_000);
 });

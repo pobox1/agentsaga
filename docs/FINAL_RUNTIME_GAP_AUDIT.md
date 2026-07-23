@@ -55,6 +55,24 @@ Starting SHA: `c57fed8bb631ab1011bb726299e42a60680a9f55`.
 
 Local evidence on 2026-07-23: orchestrator unit tests 32 passed with 5 integration-gated tests skipped; web tests 41 passed; the separately enabled PostgreSQL 16 + Redis 7 + Anvil 5042002 suite passed all 5 tests, including automatic success, automatic five-node failure/reverse compensation with distinct remediation roles, hash-first worker restart recovery without resend, concurrent scheduler claims, and projection retry after durable ingestion. Remote CI evidence is recorded only after the pushed commit's workflow completes.
 
+## Third runtime hardening pass
+
+Starting SHA: `17a0e7a78fb094677877893a83cbc90413a68158`.
+
+- **Resolved locally:** processing projections carry a fenced owner/expiry lease; an expired projector lease is reclaimable, while a stale owner cannot overwrite the new result.
+- **Resolved locally:** each source projects strictly by `(blockNumber, logIndex)`. A failed, delayed, or actively leased head event blocks later events instead of allowing state reordering.
+- **Resolved locally:** receipt projection treats a missing workflow or temporary receipt RPC failure as a retryable dependency, never as a successfully processed no-op.
+- **Resolved locally:** queue publication uses a PostgreSQL `QueueOutbox` record staged in the same transaction as the durable `WorkerAction`; publishers recover expired leases and BullMQ job IDs remain deterministic.
+- **Resolved locally:** the worker scans `queued` actions for missing or terminal BullMQ jobs and stages a new resume sequence, repairing actions orphaned between database and Redis lifecycle boundaries.
+- **Resolved locally:** terminal agent/evaluator artifacts and terminal write actions reconstruct their required continuation through the outbox if the next action was lost.
+- **Resolved locally:** signer coverage can be evaluated by workflow/node scope, and autonomous bootstrap requires every mandatory role for every configured workflow rather than accepting unrelated global role totals.
+- **Resolved locally:** every write persists a calldata-bound `TransactionIntent` before broadcast. Immediately before calling the signer it becomes `broadcast_unknown`; if the transport loses the returned hash, automatic resend remains paused for operator/RPC reconciliation.
+- **Resolved locally:** a PostgreSQL + Redis integration test carries a durably ingested projected approval through the real event-resume helper, scheduler lease, outbox publisher and BullMQ queue, then proves expired outbox lease and orphan repair.
+
+Migration `202607230007_ordered_projection_outbox_intents` adds projection lease fencing, ordered-source indexing, `QueueOutbox`, and `TransactionIntent`. Local empty-schema migration application and datamodel drift validation must remain green in CI.
+
+Local evidence for this pass on 2026-07-23: 35 orchestrator unit tests passed; all 8 explicitly enabled PostgreSQL 16 + Redis 7 + Anvil 5042002 integration tests passed; 41 web tests passed; 7 migrations are current with no datamodel drift. Deployment evidence remains unchanged and `not-deployed`.
+
 This audit uses only these classifications:
 
 - **verified and working**

@@ -5,6 +5,7 @@ import { WorkerRuntime } from "./worker-runtime.js";
 import { loadCapabilityConfiguration } from "./capabilities.js";
 import { bootstrapSigners } from "./signer-bootstrap.js";
 import { publishProcessHeartbeat } from "./runtime-heartbeat.js";
+import { PostgresQueueOutbox } from "./queue-outbox.js";
 
 const config = loadConfig();
 if (!config.REDIS_URL || !config.DATABASE_URL) throw new Error("Worker requires REDIS_URL and DATABASE_URL");
@@ -12,8 +13,11 @@ const capabilityConfiguration = loadCapabilityConfiguration(config.OPERATION_MOD
 const queues = new QueueRuntime(config.REDIS_URL, { ...capabilityConfiguration, gitCommit: config.GIT_COMMIT_SHA });
 const { registry: signers } = await bootstrapSigners({ config });
 const runtime = new WorkerRuntime(queues, config, signers, capabilityConfiguration.capabilities);
+const outbox = new PostgresQueueOutbox(prisma, queues);
 runtime.registerAll();
 await queues.waitUntilReady();
+await outbox.reconcileOrphanedQueuedActions();
+await outbox.dispatchPending();
 const facts = await runtime.factualProcessorCapabilities();
 if (config.OPERATION_MODE === "autonomous") {
   const unavailable = Object.entries(facts).filter(([, fact]) => !fact.operational).map(([name]) => name);
@@ -64,12 +68,19 @@ await publishHeartbeat();
 const heartbeat = setInterval(() => void publishHeartbeat().catch((error: unknown) => {
   process.stderr.write(`Worker heartbeat failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
 }), 15_000);
+const outboxPump = setInterval(() => void (async () => {
+  await outbox.reconcileOrphanedQueuedActions();
+  await outbox.dispatchPending();
+})().catch((error: unknown) => {
+  process.stderr.write(`Queue outbox recovery failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
+}), 5_000);
 
 let closing = false;
 const close = async () => {
   if (closing) return;
   closing = true;
   clearInterval(heartbeat);
+  clearInterval(outboxPump);
   await queues.pauseWorkers();
   await queues.close();
   await prisma.$disconnect();

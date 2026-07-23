@@ -4,7 +4,7 @@ import { z } from "zod";
 import { runLocalScenario } from "./demo.js";
 import { loadConfig, type OrchestratorConfig } from "./config.js";
 import { createDemoAgents } from "./agents.js";
-import { prisma, PostgresActionLedger } from "./postgres.js";
+import { prisma } from "./postgres.js";
 import { QueueRuntime, queueNames, type QueueName } from "./queues.js";
 import { createPublicClient, http } from "viem";
 import { arcTestnet } from "@agentsaga/contracts";
@@ -12,6 +12,8 @@ import { loadCapabilityConfiguration } from "./capabilities.js";
 import { buildReadiness, parseHeartbeat } from "./readiness.js";
 import { checkMigrationReadiness } from "./migration-readiness.js";
 import { publishProcessHeartbeat } from "./runtime-heartbeat.js";
+import { PostgresQueueOutbox } from "./queue-outbox.js";
+import { Prisma } from "@prisma/client";
 
 const localScenarioBody = z.object({ failRisk: z.boolean().optional() }).strict();
 const addressParams = z.object({ address: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
@@ -28,6 +30,7 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
   const apiTokens = new Set([config.ORCHESTRATOR_API_TOKEN, ...(config.ORCHESTRATOR_API_TOKENS?.split(",") ?? [])].filter((token): token is string => Boolean(token?.trim())).map((token) => token.trim()));
   const capabilityConfiguration = loadCapabilityConfiguration(config.OPERATION_MODE, config.RUNTIME_CAPABILITIES_JSON);
   const queueRuntime = config.REDIS_URL ? new QueueRuntime(config.REDIS_URL, { ...capabilityConfiguration, gitCommit: config.GIT_COMMIT_SHA }) : undefined;
+  const queueOutbox = queueRuntime && config.DATABASE_URL ? new PostgresQueueOutbox(prisma, queueRuntime) : undefined;
   const arcClient = createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
   const capabilities = capabilityConfiguration.capabilities;
   app.setErrorHandler((error, request, reply) => {
@@ -43,6 +46,8 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
     if (!queueRuntime) return;
     const publish = () => publishProcessHeartbeat(queueRuntime.connection, "api", capabilityConfiguration, config.GIT_COMMIT_SHA, config.HEARTBEAT_STALE_SECONDS);
     await publish();
+    await queueOutbox?.reconcileOrphanedQueuedActions();
+    await queueOutbox?.dispatchPending();
     apiHeartbeat = setInterval(() => void publish().catch((error: unknown) => app.log.error({ err: error }, "API heartbeat failed")), 15_000);
   });
   app.addHook("onClose", async () => { if (apiHeartbeat) clearInterval(apiHeartbeat); await queueRuntime?.close(); await prisma.$disconnect(); });
@@ -85,13 +90,15 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
     const deployment = config.WORKFLOW_FACTORY_ADDRESS && config.FACTORY_DEPLOYMENT_BLOCK !== undefined ? "configured" as const : "not-configured" as const;
     const migrationDetail = config.DATABASE_URL ? await checkMigrationReadiness(prisma) : undefined;
     const migrations = migrationDetail?.status ?? "not-configured" as const;
-    const projectionCounts = config.DATABASE_URL
+    const durabilityCounts = config.DATABASE_URL
       ? await Promise.all([
         prisma.indexedEvent.count({ where: { projectionStatus: { in: ["received", "processing"] } } }),
         prisma.indexedEvent.count({ where: { projectionStatus: "failed" } }),
-      ]).catch(() => [0, 1])
-      : [0, 0];
-    const [projectionBacklog = 0, failedProjections = 0] = projectionCounts;
+        prisma.queueOutbox.count({ where: { status: { in: ["pending", "publishing", "failed"] } } }),
+        prisma.transactionIntent.count({ where: { status: "broadcast_unknown" } }),
+      ]).catch(() => [0, 1, 1, 1])
+      : [0, 0, 0, 0];
+    const [projectionBacklog = 0, failedProjections = 0, outboxBacklog = 0, unknownBroadcasts = 0] = durabilityCounts;
     const readiness = buildReadiness({
       mode: config.OPERATION_MODE,
       arcRpc,
@@ -118,13 +125,15 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
       indexerCursor: cursor,
       migrations,
       migrationDetail,
+      outboxBacklog,
+      unknownBroadcasts,
       deployment,
       circle: config.CIRCLE_INTEGRATION_STATUS,
       x402: config.X402_INTEGRATION_STATUS,
     });
   });
   app.get("/metrics", async (_request, reply) => {
-    const [waiting, failed, deadLetters, projectionBacklog, projectionFailed, recovering] = config.DATABASE_URL
+    const [waiting, failed, deadLetters, projectionBacklog, projectionFailed, recovering, outboxBacklog, unknownBroadcasts] = config.DATABASE_URL
       ? await Promise.all([
         prisma.workerAction.count({ where: { status: "waiting" } }),
         prisma.workerAction.count({ where: { status: { in: ["failed", "dead_lettered", "blocked_permanently"] } } }),
@@ -132,8 +141,10 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
         prisma.indexedEvent.count({ where: { projectionStatus: { in: ["received", "processing"] } } }),
         prisma.indexedEvent.count({ where: { projectionStatus: "failed" } }),
         prisma.chainTransaction.count({ where: { status: { in: ["submitted", "confirming", "recovery_paused"] } } }),
-      ]).catch(() => [0, 0, 0, 0, 0, 0])
-      : [0, 0, 0, 0, 0, 0];
+        prisma.queueOutbox.count({ where: { status: { in: ["pending", "publishing", "failed"] } } }),
+        prisma.transactionIntent.count({ where: { status: "broadcast_unknown" } }),
+      ]).catch(() => [0, 0, 0, 0, 0, 0, 0, 0])
+      : [0, 0, 0, 0, 0, 0, 0, 0];
     const queueCounts = queueRuntime
       ? await Promise.all(Object.values(queueRuntime.queues).map((queue) => queue.getJobCounts("waiting", "active", "failed", "delayed"))).catch(() => [])
       : [];
@@ -147,6 +158,8 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
       "# TYPE agentsaga_event_projection_backlog gauge", `agentsaga_event_projection_backlog ${projectionBacklog}`,
       "# TYPE agentsaga_event_projection_failed gauge", `agentsaga_event_projection_failed ${projectionFailed}`,
       "# TYPE agentsaga_transaction_recovery gauge", `agentsaga_transaction_recovery ${recovering}`,
+      "# TYPE agentsaga_queue_outbox_backlog gauge", `agentsaga_queue_outbox_backlog ${outboxBacklog}`,
+      "# TYPE agentsaga_unknown_broadcast_intents gauge", `agentsaga_unknown_broadcast_intents ${unknownBroadcasts}`,
       "# TYPE agentsaga_queue_jobs gauge",
       `agentsaga_queue_jobs{state="waiting"} ${total("waiting")}`,
       `agentsaga_queue_jobs{state="active"} ${total("active")}`,
@@ -200,7 +213,12 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
     const id = z.object({ id: z.string().min(1).max(128) }).safeParse(request.params); if (!id.success) return reply.code(400).send({ error: "invalid_dead_letter" });
     if (!queueRuntime || !config.DATABASE_URL) return reply.code(503).send({ error: "persistent_runtime_not_configured" });
     const record = await prisma.deadLetterRecord.findUnique({ where: { id: id.data.id } }); if (!record || record.resolvedAt) return reply.code(404).send({ error: "dead_letter_not_found" });
-    await queueRuntime.enqueue(record.queue as QueueName, `dlq-retry:${record.id}:${record.attempts}`, record.payload);
+    const payload = record.payload as Record<string, unknown>;
+    if (typeof payload.workflow !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(payload.workflow)) return reply.code(409).send({ error: "dead_letter_missing_workflow_scope" });
+    const key = `dlq-retry:${record.id}:${record.attempts}`;
+    const actionId = createHash("sha256").update(key).digest("hex");
+    await queueOutbox!.stage({ id: actionId, workflow: payload.workflow, ...(typeof payload.nodeId === "number" ? { nodeId: payload.nodeId } : {}), queue: record.queue as QueueName, idempotencyKey: key, payload: record.payload as Prisma.InputJsonValue, executionAttempt: record.attempts });
+    await queueOutbox!.dispatchPending(1);
     await prisma.deadLetterRecord.update({ where: { id: record.id }, data: { resolvedAt: new Date() } });
     return reply.code(202).send({ status: "queued" });
   });
@@ -216,8 +234,8 @@ export function createServer(config: OrchestratorConfig = loadConfig()): Fastify
       if (!config.DATABASE_URL || !queueRuntime) return reply.code(503).send({ error: "persistent_runtime_not_configured" });
       const workflow = parsed.data.address.toLowerCase();
       const key = `${queue}:${workflow}`; const id = createHash("sha256").update(key).digest("hex");
-      await new PostgresActionLedger().reserve({ id, workflow, action: queue, idempotencyKey: key, payload: { workflow } });
-      await queueRuntime.enqueue(queue as QueueName, key, { workflow });
+      await queueOutbox!.stage({ id, workflow, queue: queue as QueueName, idempotencyKey: key, payload: { workflow } });
+      await queueOutbox!.dispatchPending(1);
       return reply.code(202).send({ status: "queued", action: queue, idempotencyKey: key });
     });
   }

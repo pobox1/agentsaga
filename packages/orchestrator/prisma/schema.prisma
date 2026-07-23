@@ -30,6 +30,8 @@ model IndexedEvent {
   lastProjectionError String?
   nextProjectionAttemptAt DateTime?
   processingStartedAt DateTime?
+  projectionLeaseOwner String?
+  projectionLeaseExpiresAt DateTime?
   processedAt      DateTime?
   createdAt        DateTime @default(now())
 
@@ -37,6 +39,7 @@ model IndexedEvent {
   @@index([chainId, blockNumber])
   @@index([sourceId, projectionStatus, nextProjectionAttemptAt], map: "IndexedEvent_projection_queue_idx")
   @@index([projectionStatus, nextProjectionAttemptAt])
+  @@index([sourceId, blockNumber, logIndex], map: "IndexedEvent_source_order_idx")
 }
 
 model WorkerAction {
@@ -67,6 +70,50 @@ model WorkerAction {
 
   @@index([workflow, status])
   @@index([status, nextAttemptAt])
+}
+
+model QueueOutbox {
+  id               String   @id
+  queue            String
+  idempotencyKey   String
+  actionId         String?
+  resumeSequence   Int      @default(0)
+  executionAttempt Int      @default(0)
+  payload          Json
+  status           String   @default("pending")
+  leaseOwner       String?
+  leaseExpiresAt   DateTime?
+  publishedAt      DateTime?
+  attempts         Int      @default(0)
+  lastError        String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([actionId, resumeSequence, executionAttempt])
+  @@index([status, leaseExpiresAt, createdAt])
+}
+
+model TransactionIntent {
+  id               String   @id
+  logicalActionKey String   @unique
+  workflowAddress  String
+  chainId          Int
+  action           String
+  requestHash      String
+  sender           String
+  target           String
+  status           String
+  transactionHash  String?
+  payload          Json
+  preparedAt       DateTime @default(now())
+  broadcastStartedAt DateTime?
+  submittedAt      DateTime?
+  resolvedAt       DateTime?
+  lastError        String?
+  updatedAt        DateTime @updatedAt
+
+  @@index([status, updatedAt])
+  @@index([workflowAddress, action])
 }
 
 model ExecutionRecord {

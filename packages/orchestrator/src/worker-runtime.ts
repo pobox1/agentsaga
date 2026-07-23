@@ -13,6 +13,7 @@ import { defaultCapabilities, processorCapability, type RuntimeCapabilities } fr
 import { SignerRegistry, type SignerRole } from "./signer-registry.js";
 import type { ContractWriteRequest } from "./transaction-signer.js";
 import type { WorkflowAgent } from "./types.js";
+import { PostgresQueueOutbox } from "./queue-outbox.js";
 
 const payloadSchema = z.object({
   workflow: z.string().regex(/^0x[0-9a-fA-F]{40}$/), nodeId: z.number().int().min(0).max(15).optional(),
@@ -43,6 +44,7 @@ export type ProcessorOutcome =
 export class WorkerRuntime {
   private readonly client: PublicClient;
   private readonly capabilities: RuntimeCapabilities;
+  private readonly outbox: PostgresQueueOutbox;
   constructor(
     readonly queues: QueueRuntime,
     private readonly config: OrchestratorConfig,
@@ -53,6 +55,7 @@ export class WorkerRuntime {
   ) {
     this.client = client ?? createPublicClient({ chain: arcTestnet, transport: http(config.ARC_TESTNET_RPC_URL) });
     this.capabilities = capabilities ?? defaultCapabilities(config.OPERATION_MODE);
+    this.outbox = new PostgresQueueOutbox(prisma, queues);
     this.signers.onRegistered(async (scope) => { await prisma.workerAction.updateMany({ where: { workflow: scope.workflow.toLowerCase(), status: "waiting", waitingReason: "role_signer", ...(scope.nodeId === undefined ? {} : { nodeId: scope.nodeId }) }, data: { nextAttemptAt: new Date() } }); });
   }
 
@@ -124,7 +127,11 @@ export class WorkerRuntime {
     const payload = { ...parsed.data, workflow: parsed.data.workflow.toLowerCase() as Address } as ActionPayload;
     const logicalActionKey = payload.logicalActionKey ?? `${name}:${payload.workflow}:${payload.nodeId ?? "workflow"}`;
     const existing = await prisma.workerAction.findUnique({ where: { idempotencyKey: logicalActionKey } });
-    if (existing && ["completed", "already_complete", "blocked_permanently", "dead_lettered", "cancelled"].includes(existing.status)) return { status: "already_complete", detail: `Logical action is terminal: ${existing.status}` };
+    if (existing && ["completed", "already_complete"].includes(existing.status)) {
+      await this.ensureContinuationAfterTerminal(name, payload);
+      return { status: "already_complete", detail: `Logical action is terminal and its continuation is ensured: ${existing.status}` };
+    }
+    if (existing && ["blocked_permanently", "dead_lettered", "cancelled"].includes(existing.status)) return { status: "already_complete", detail: `Logical action is terminal: ${existing.status}` };
     const action = await prisma.workerAction.upsert({
       where: { idempotencyKey: logicalActionKey },
       create: { id: payload.actionId ?? stableId(logicalActionKey), workflow: payload.workflow, nodeId: payload.nodeId ?? null, action: name, idempotencyKey: logicalActionKey, status: "reserved", attempts: 0, payload: payload as Prisma.InputJsonValue },
@@ -177,6 +184,29 @@ export class WorkerRuntime {
     return this.executeWrite(name, payload);
   }
 
+  private async ensureContinuationAfterTerminal(name: QueueName, payload: ActionPayload): Promise<void> {
+    if ((name === "execute-agent" || name === "execute-compensation") && payload.nodeId !== undefined) {
+      const { context } = await this.readJobContext(payload);
+      const executionType = name === "execute-compensation" || context.jobType === "compensation" ? "compensation" : "service";
+      const execution = await prisma.agentExecution.findUnique({
+        where: { workflowAddress_nodeId_jobId_executionType: { workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId: context.jobId.toString(), executionType } },
+      });
+      if (execution?.evidenceHash) await this.enqueueNext("submit-deliverable", this.withJobContext(payload, context, execution.evidenceHash as Hash));
+      return;
+    }
+    if (name === "evaluate-job" && payload.nodeId !== undefined) {
+      const { context } = await this.readJobContext(payload);
+      const decision = await prisma.evaluatorDecision.findUnique({
+        where: { workflowAddress_nodeId_jobId_executionType: { workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId: context.jobId.toString(), executionType: context.jobType } },
+      });
+      if (decision) await this.enqueueNext(decision.decision === "approve" ? "complete-job" : "reject-job", this.withJobContext(payload, context, decision.evidenceHash as Hash));
+      return;
+    }
+    if (["activate-node", "submit-deliverable", "complete-job", "reject-job", "open-compensation", "expire-job", "expire-compensation", "expire-workflow"].includes(name)) {
+      await this.advanceAfterWrite(name, payload);
+    }
+  }
+
   private async discoverReadyNodes(workflow: Address): Promise<ProcessorOutcome> {
     const [count, status, finalized] = await Promise.all([
       this.client.readContract({ address: workflow, abi: workflowCoordinatorAbi, functionName: "nodeCount" }),
@@ -196,9 +226,10 @@ export class WorkerRuntime {
         await this.persistPlannedWaiting(workflow, nodeId, "activate-node", logicalKey, "human_approval", { workflow, nodeId }); humanGated++; continue;
       }
       const actionId = stableId(logicalKey);
-      await prisma.workerAction.upsert({ where: { idempotencyKey: logicalKey }, create: { id: actionId, workflow, nodeId, action: "activate-node", idempotencyKey: logicalKey, status: "queued", payload: { workflow, nodeId } }, update: { status: "queued", waitingReason: null, nextAttemptAt: null } });
-      await this.queues.enqueue("activate-node", logicalKey, { workflow, nodeId }, { actionId, resumeSequence: existing?.resumeSequence ?? 0, executionAttempt: existing?.executionAttempts ?? 0 }); enqueued++;
+      await this.outbox.stage({ id: actionId, workflow, nodeId, queue: "activate-node", idempotencyKey: logicalKey, payload: { workflow, nodeId }, resumeSequence: existing?.resumeSequence ?? 0, executionAttempt: existing?.executionAttempts ?? 0 });
+      enqueued++;
     }
+    if (enqueued) await this.outbox.dispatchPending(enqueued);
     if (humanGated && !enqueued) return { status: "waiting", reason: "human_approval", retryable: false, detail: `${humanGated} ready node(s) require NodeApproved` };
     return { status: "complete", enqueued };
   }
@@ -215,7 +246,10 @@ export class WorkerRuntime {
     const existing = await prisma.agentExecution.findUnique({
       where: { workflowAddress_nodeId_jobId_executionType: { workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId, executionType } },
     });
-    if (existing) return { status: "already_complete", detail: "Agent execution artifact already exists" };
+    if (existing) {
+      await this.enqueueNext("submit-deliverable", this.withJobContext(payload, context, existing.evidenceHash as Hash | undefined));
+      return { status: "already_complete", detail: "Agent execution artifact exists; ensured the submit stage is queued" };
+    }
     const selected = this.agents.find((agent) => agent.id === payload.agentId) ?? this.agents[compensation ? this.agents.length - 1 : payload.nodeId % (this.agents.length - 1)];
     if (!selected) return { status: "waiting", reason: "agent_adapter", retryable: true, detail: "No matching agent adapter is configured" };
     const input = { workflowId: payload.workflow, nodeId: payload.nodeId, specification: { compensation: executionType === "compensation", jobId, specificationHash: context.specificationHash }, dependencyEvidence: [], maximumCost: context.budget };
@@ -235,6 +269,13 @@ export class WorkerRuntime {
       where: { workflowAddress_nodeId_jobId_executionType: { workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId, executionType: context.jobType } },
     });
     if (!execution?.output) return { status: "waiting", reason: "upstream_artifact", retryable: true, detail: "Agent execution result is not stored" };
+    const priorDecision = await prisma.evaluatorDecision.findUnique({
+      where: { workflowAddress_nodeId_jobId_executionType: { workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId, executionType: context.jobType } },
+    });
+    if (priorDecision) {
+      await this.enqueueNext(priorDecision.decision === "approve" ? "complete-job" : "reject-job", this.withJobContext(payload, context, priorDecision.evidenceHash as Hash));
+      return { status: "already_complete", detail: "Evaluator artifact exists; ensured the terminal write stage is queued" };
+    }
     const result = execution.output as unknown as Parameters<DeterministicSchemaEvaluator["evaluate"]>[0]["result"];
     const decision = await new DeterministicSchemaEvaluator().evaluate({ workflowId: payload.workflow, nodeId: payload.nodeId, result });
     await prisma.evaluatorDecision.upsert({ where: { id: stableId(`${payload.workflow}:${payload.nodeId}:${jobId}:${context.jobType}`) }, create: { id: stableId(`${payload.workflow}:${payload.nodeId}:${jobId}:${context.jobType}`), workflowAddress: payload.workflow, nodeId: payload.nodeId, jobId, executionType: context.jobType, evaluatorId: decision.evaluatorId, decision: decision.decision, reasonCode: decision.reasonCode, evidenceHash: decision.evidenceHash, evaluatedAt: new Date(decision.evaluatedAt) }, update: {} });
@@ -251,8 +292,13 @@ export class WorkerRuntime {
       : undefined;
     const logicalActionKey = payload.logicalActionKey ?? `${name}:${payload.workflow}:${payload.nodeId ?? "workflow"}`;
     const action = await prisma.workerAction.findUniqueOrThrow({ where: { idempotencyKey: logicalActionKey } });
-    const stored = action.transactionHash
-      ? await prisma.chainTransaction.findUnique({ where: { hash: action.transactionHash } })
+    const intent = await prisma.transactionIntent.findUnique({ where: { logicalActionKey } });
+    if (intent?.status === "broadcast_unknown" && !intent.transactionHash) {
+      return { status: "waiting", reason: "external_service", retryable: false, detail: "Broadcast outcome is unknown; automatic resend is paused pending operator/RPC reconciliation" };
+    }
+    const persistedHash = action.transactionHash ?? intent?.transactionHash;
+    const stored = persistedHash
+      ? await prisma.chainTransaction.findUnique({ where: { hash: persistedHash } })
       : await prisma.chainTransaction.findFirst({ where: { logicalActionKey, status: { notIn: ["reverted", "dropped", "replaced"] } }, orderBy: { submittedAt: "desc" } });
     if (!stored && await this.actionAlreadyComplete(name, payload, node, context)) return { status: "already_complete", detail: "Fresh onchain action-specific state is terminal" };
     if (name === "activate-node" && node && Number(node.status) === 0) return { status: "waiting", reason: "workflow_state", retryable: true, detail: "Node dependencies are not ready" };
@@ -293,13 +339,41 @@ export class WorkerRuntime {
       hash = stored.hash as Hash;
       if (!action.transactionHash) await prisma.workerAction.update({ where: { id: action.id }, data: { transactionHash: hash } });
     } else {
-      await this.client.call({ account: sender, to: request.address, data: encodeFunctionData({ abi: request.abi, functionName: request.functionName, args: request.args }) });
-      await prisma.workerAction.update({ where: { id: action.id }, data: { signerRole: role, lastResult: { status: "prepared", sender, target: request.address } } });
-      hash = await signer.sendContractTransaction(request);
+      const encodedRequest = encodeFunctionData({ abi: request.abi, functionName: request.functionName, args: request.args });
+      await this.client.call({ account: sender, to: request.address, data: encodedRequest });
+      const requestHash = stableId(`${arcTestnet.id}:${sender.toLowerCase()}:${request.address.toLowerCase()}:${encodedRequest}`);
+      if (intent && intent.requestHash !== requestHash) return { status: "blocked", reason: "configuration_error", detail: "Prepared transaction intent does not match the fresh write request" };
+      await prisma.transactionIntent.upsert({
+        where: { logicalActionKey },
+        create: {
+          id: stableId(`intent:${logicalActionKey}`),
+          logicalActionKey,
+          workflowAddress: payload.workflow,
+          chainId: arcTestnet.id,
+          action: name,
+          requestHash,
+          sender: sender.toLowerCase(),
+          target: request.address.toLowerCase(),
+          status: "prepared",
+          payload: jsonValue({ request: effectivePayload, calldata: encodedRequest }),
+        },
+        update: {},
+      });
+      await prisma.$transaction([
+        prisma.transactionIntent.update({ where: { logicalActionKey }, data: { status: "broadcast_unknown", broadcastStartedAt: new Date(), lastError: null } }),
+        prisma.workerAction.update({ where: { id: action.id }, data: { signerRole: role, lastResult: { status: "broadcast_unknown", requestHash, sender, target: request.address } } }),
+      ]);
+      try {
+        hash = await signer.sendContractTransaction(request);
+      } catch (error) {
+        await prisma.transactionIntent.update({ where: { logicalActionKey }, data: { lastError: sanitizeError(error) } });
+        throw error;
+      }
       const submittedAt = new Date();
       await prisma.$transaction([
         prisma.workerAction.update({ where: { id: action.id }, data: { transactionHash: hash, transactionNonce: null, signerRole: role, lastResult: { status: "submitted", hash, sender, nonce: null } } }),
         prisma.chainTransaction.create({ data: { hash, workflowAddress: payload.workflow, chainId: arcTestnet.id, action: name, logicalActionKey, status: "submitted", fromAddress: sender.toLowerCase(), toAddress: request.address.toLowerCase(), transactionNonce: null, payload: jsonValue(effectivePayload), submittedAt } }),
+        prisma.transactionIntent.update({ where: { logicalActionKey }, data: { status: "submitted", transactionHash: hash, submittedAt } }),
       ]);
     }
     await this.enrichTransactionNonce(hash, action.id);
@@ -327,7 +401,10 @@ export class WorkerRuntime {
       throw error;
     }
     if (receipt.status !== "success") {
-      await prisma.chainTransaction.update({ where: { hash }, data: { status: "reverted", blockNumber: receipt.blockNumber, confirmedAt: new Date(), lastCheckedAt: new Date() } });
+      await prisma.$transaction([
+        prisma.chainTransaction.update({ where: { hash }, data: { status: "reverted", blockNumber: receipt.blockNumber, confirmedAt: new Date(), lastCheckedAt: new Date() } }),
+        prisma.transactionIntent.updateMany({ where: { logicalActionKey }, data: { status: "reverted", transactionHash: hash, resolvedAt: new Date() } }),
+      ]);
       throw new Error(`${name} transaction reverted`);
     }
     const verified = await this.actionAlreadyComplete(name, effectivePayload,
@@ -336,6 +413,7 @@ export class WorkerRuntime {
     );
     const transactionStatus = verified ? "confirmed_state_verified" : "confirmed_verification_incomplete";
     await prisma.chainTransaction.update({ where: { hash }, data: { status: transactionStatus, blockNumber: receipt.blockNumber, confirmedAt: new Date(), lastCheckedAt: new Date(), verificationMethod: verified ? "state" : "incomplete", verificationResult: { action: name, verified } } });
+    await prisma.transactionIntent.updateMany({ where: { logicalActionKey }, data: { status: transactionStatus, transactionHash: hash, resolvedAt: new Date() } });
     await this.advanceAfterWrite(name, effectivePayload);
     return { status: "complete", detail: `${name} ${transactionStatus} in ${hash}` };
   }
@@ -442,8 +520,19 @@ export class WorkerRuntime {
   private async enqueueNext(name: QueueName, payload: ActionPayload): Promise<void> {
     const phase = payload.jobType ? `:${payload.jobType}:${payload.jobId ?? "current"}` : "";
     const logicalKey = `${payload.workflow}:${payload.nodeId ?? "workflow"}:${name}${phase}`; const actionId = stableId(logicalKey);
-    await prisma.workerAction.upsert({ where: { idempotencyKey: logicalKey }, create: { id: actionId, workflow: payload.workflow, nodeId: payload.nodeId ?? null, action: name, idempotencyKey: logicalKey, status: "queued", payload: jsonValue(payload) }, update: {} });
-    await this.queues.enqueue(name, logicalKey, payload, { actionId, resumeSequence: 0, executionAttempt: 0 });
+    const existing = await prisma.workerAction.findUnique({ where: { idempotencyKey: logicalKey } });
+    if (existing && ["completed", "already_complete", "blocked_permanently", "dead_lettered", "cancelled"].includes(existing.status)) return;
+    await this.outbox.stage({
+      id: actionId,
+      workflow: payload.workflow,
+      ...(payload.nodeId === undefined ? {} : { nodeId: payload.nodeId }),
+      queue: name,
+      idempotencyKey: logicalKey,
+      payload: jsonValue(payload),
+      resumeSequence: existing?.resumeSequence ?? 0,
+      executionAttempt: existing?.executionAttempts ?? 0,
+    });
+    await this.outbox.dispatchPending(1);
   }
 
   private async reconcile(workflow: Address): Promise<ProcessorOutcome> {

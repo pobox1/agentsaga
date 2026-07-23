@@ -60,16 +60,20 @@ export class PostgresCursorStore implements CursorStore {
     } catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") return false; throw error; }
   }
   async loadPendingLogs(id: string, limit = 100): Promise<Array<{ id: string; log: Log }>> {
-    const rows = await this.db.indexedEvent.findMany({
+    const row = await this.db.indexedEvent.findFirst({
       where: {
         sourceId: id,
-        projectionStatus: { in: ["received", "failed"] },
-        OR: [{ nextProjectionAttemptAt: null }, { nextProjectionAttemptAt: { lte: new Date() } }],
+        projectionStatus: { not: "processed" },
       },
       orderBy: [{ blockNumber: "asc" }, { logIndex: "asc" }],
-      take: limit,
     });
-    return rows.map((row) => {
+    if (!row || limit <= 0) return [];
+    const now = new Date();
+    const claimable = row.projectionStatus === "received"
+      || row.projectionStatus === "failed" && (!row.nextProjectionAttemptAt || row.nextProjectionAttemptAt <= now)
+      || row.projectionStatus === "processing" && (!row.projectionLeaseExpiresAt || row.projectionLeaseExpiresAt <= now);
+    if (!claimable) return [];
+    return [row].map((row) => {
       const payload = row.payload as { raw: Record<string, unknown> };
       const raw = payload.raw;
       return {
@@ -88,39 +92,48 @@ export class PostgresCursorStore implements CursorStore {
       };
     });
   }
-  async claimProjection(eventId: string): Promise<boolean> {
+  async claimProjection(eventId: string, leaseOwner: string, leaseSeconds = 30): Promise<boolean> {
+    const now = new Date();
     const result = await this.db.indexedEvent.updateMany({
       where: {
         id: eventId,
-        projectionStatus: { in: ["received", "failed"] },
-        OR: [{ nextProjectionAttemptAt: null }, { nextProjectionAttemptAt: { lte: new Date() } }],
+        OR: [
+          { projectionStatus: "received" },
+          { projectionStatus: "failed", OR: [{ nextProjectionAttemptAt: null }, { nextProjectionAttemptAt: { lte: now } }] },
+          { projectionStatus: "processing", OR: [{ projectionLeaseExpiresAt: null }, { projectionLeaseExpiresAt: { lte: now } }] },
+        ],
       },
-      data: { projectionStatus: "processing", processingStartedAt: new Date() },
+      data: { projectionStatus: "processing", processingStartedAt: now, projectionLeaseOwner: leaseOwner, projectionLeaseExpiresAt: new Date(now.getTime() + leaseSeconds * 1_000) },
     });
     return result.count === 1;
   }
-  async markProjectionProcessed(eventId: string): Promise<void> {
-    await this.db.indexedEvent.update({
-      where: { id: eventId },
+  async markProjectionProcessed(eventId: string, leaseOwner: string): Promise<void> {
+    await this.db.indexedEvent.updateMany({
+      where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner },
       data: {
         projectionStatus: "processed",
         processedAt: new Date(),
         processingStartedAt: null,
+        projectionLeaseOwner: null,
+        projectionLeaseExpiresAt: null,
         nextProjectionAttemptAt: null,
         lastProjectionError: null,
       },
     });
   }
-  async markProjectionFailed(eventId: string, error: string): Promise<void> {
-    const current = await this.db.indexedEvent.findUniqueOrThrow({ where: { id: eventId }, select: { projectionAttempts: true } });
+  async markProjectionFailed(eventId: string, leaseOwner: string, error: string): Promise<void> {
+    const current = await this.db.indexedEvent.findFirst({ where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner }, select: { projectionAttempts: true } });
+    if (!current) return;
     const attempts = current.projectionAttempts + 1;
-    await this.db.indexedEvent.update({
-      where: { id: eventId },
+    await this.db.indexedEvent.updateMany({
+      where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner },
       data: {
         projectionStatus: "failed",
         projectionAttempts: attempts,
         lastProjectionError: error.slice(0, 2_000),
         processingStartedAt: null,
+        projectionLeaseOwner: null,
+        projectionLeaseExpiresAt: null,
         nextProjectionAttemptAt: new Date(Date.now() + Math.min(300_000, 1_000 * 2 ** Math.min(attempts, 8))),
       },
     });

@@ -2,6 +2,8 @@ import { createCipheriv, randomBytes, scryptSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
 import { bootstrapSigners } from "./signer-bootstrap.js";
+import { SignerRegistry } from "./signer-registry.js";
+import type { TransactionSigner } from "./transaction-signer.js";
 
 const workflow = "0x1111111111111111111111111111111111111111";
 const signerAddress = "0x2222222222222222222222222222222222222222";
@@ -46,7 +48,24 @@ describe("production signer bootstrap", () => {
     ] }) });
     expect((await bootstrapSigners({ config: circleConfig })).result.waitingExternalAuth).toBe(1);
     const autonomous = loadConfig({ NODE_ENV: "test", OPERATION_MODE: "autonomous" });
-    await expect(bootstrapSigners({ config: autonomous })).rejects.toThrow(/missing ready roles/);
+    await expect(bootstrapSigners({ config: autonomous })).rejects.toThrow(/no workflow-scoped signer configuration/);
+  });
+
+  it("measures signer coverage by workflow and node scope instead of role totals", async () => {
+    const registry = new SignerRegistry();
+    const readySigner: TransactionSigner = {
+      address: async () => signerAddress,
+      status: async () => "ready",
+      sendContractTransaction: async () => { throw new Error("not used"); },
+    };
+    await registry.register({ workflow, role: "provider" }, readySigner);
+    const secondWorkflow = "0x5555555555555555555555555555555555555555";
+    const coverage = await registry.coverage([
+      { workflow, nodeId: 3, role: "provider" },
+      { workflow: secondWorkflow, nodeId: 3, role: "provider" },
+    ]);
+    expect(coverage).toMatchObject({ required: 2, covered: 1 });
+    expect(coverage.missing).toEqual([{ workflow: secondWorkflow, nodeId: 3, role: "provider" }]);
   });
 });
 
