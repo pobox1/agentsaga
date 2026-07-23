@@ -36,6 +36,7 @@ pnpm install
 pnpm --filter @agentsaga/web typecheck
 pnpm --filter @agentsaga/orchestrator typecheck
 pnpm --filter @agentsaga/orchestrator test
+pnpm --filter @agentsaga/orchestrator exec prisma migrate deploy
 & .\\.tools\\foundry\\forge.exe test
 & .\\.tools\\foundry\\forge.exe coverage --ir-minimum --report summary
 pnpm --filter @agentsaga/web build
@@ -44,6 +45,14 @@ pnpm --filter @agentsaga/web build
 The checked-in Foundry binary is under `.tools/foundry`. `pnpm install` may
 require approving native build scripts on a fresh machine; no secrets are
 needed for deterministic tests.
+
+## Orchestrator operation modes
+
+- `manual`: browser wallets perform writes; core readiness never claims autonomous execution.
+- `hybrid`: configured backend role signers or adapters execute selected actions while unavailable capabilities remain durable waiting actions.
+- `autonomous`: `/ready` succeeds only when core dependencies, fresh API/worker/indexer/scheduler heartbeats, every required signer, and every agent/evaluator capability are operational.
+
+PostgreSQL, rather than BullMQ retention, is the lifecycle source of truth. It stores each stable logical action, waiting reason, due time, lease, execution attempts, and resume sequence. The scheduler re-enqueues a unique BullMQ execution attempt after prerequisites become ready.
 
 ## Arc status
 

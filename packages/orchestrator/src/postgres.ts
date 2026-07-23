@@ -32,10 +32,116 @@ export class PostgresCursorStore implements CursorStore {
   async putLogIfAbsent(id: string, log: Log, decoded?: DecodedIndexedEvent) {
     if (!log.transactionHash || log.logIndex === null || !log.blockNumber || !log.blockHash) return false;
     try {
-      await this.db.indexedEvent.create({ data: { id: `${id}:${log.transactionHash}:${log.logIndex}`, chainId: this.chainId, transactionHash: log.transactionHash, logIndex: log.logIndex, blockNumber: log.blockNumber, blockHash: log.blockHash, eventName: decoded?.eventName ?? "unrecognized", payload: (decoded?.payload ?? { address: log.address.toLowerCase(), topics: [...log.topics], data: log.data }) as Prisma.InputJsonValue } });
+      await this.db.indexedEvent.create({ data: {
+        id: `${id}:${log.transactionHash}:${log.logIndex}`,
+        sourceId: id,
+        chainId: this.chainId,
+        transactionHash: log.transactionHash,
+        logIndex: log.logIndex,
+        blockNumber: log.blockNumber,
+        blockHash: log.blockHash,
+        eventName: decoded?.eventName ?? "unrecognized",
+        payload: jsonValue({
+          decoded: decoded ?? null,
+          raw: {
+            address: log.address.toLowerCase(),
+            topics: [...log.topics],
+            data: log.data,
+            transactionHash: log.transactionHash,
+            transactionIndex: log.transactionIndex,
+            blockHash: log.blockHash,
+            blockNumber: log.blockNumber,
+            logIndex: log.logIndex,
+            removed: log.removed,
+          },
+        }),
+      } });
       return true;
     } catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") return false; throw error; }
   }
+  async loadPendingLogs(id: string, limit = 100): Promise<Array<{ id: string; log: Log }>> {
+    const row = await this.db.indexedEvent.findFirst({
+      where: {
+        sourceId: id,
+        projectionStatus: { not: "processed" },
+      },
+      orderBy: [{ blockNumber: "asc" }, { logIndex: "asc" }],
+    });
+    if (!row || limit <= 0) return [];
+    const now = new Date();
+    const claimable = row.projectionStatus === "received"
+      || row.projectionStatus === "failed" && (!row.nextProjectionAttemptAt || row.nextProjectionAttemptAt <= now)
+      || row.projectionStatus === "processing" && (!row.projectionLeaseExpiresAt || row.projectionLeaseExpiresAt <= now);
+    if (!claimable) return [];
+    return [row].map((row) => {
+      const payload = row.payload as { raw: Record<string, unknown> };
+      const raw = payload.raw;
+      return {
+        id: row.id,
+        log: {
+          address: String(raw.address) as `0x${string}`,
+          topics: (raw.topics as `0x${string}`[]) ?? [],
+          data: String(raw.data) as `0x${string}`,
+          transactionHash: row.transactionHash as `0x${string}`,
+          transactionIndex: raw.transactionIndex === null || raw.transactionIndex === undefined ? null : Number(raw.transactionIndex),
+          blockHash: row.blockHash as `0x${string}`,
+          blockNumber: row.blockNumber,
+          logIndex: row.logIndex,
+          removed: Boolean(raw.removed),
+        } as Log,
+      };
+    });
+  }
+  async claimProjection(eventId: string, leaseOwner: string, leaseSeconds = 30): Promise<boolean> {
+    const now = new Date();
+    const result = await this.db.indexedEvent.updateMany({
+      where: {
+        id: eventId,
+        OR: [
+          { projectionStatus: "received" },
+          { projectionStatus: "failed", OR: [{ nextProjectionAttemptAt: null }, { nextProjectionAttemptAt: { lte: now } }] },
+          { projectionStatus: "processing", OR: [{ projectionLeaseExpiresAt: null }, { projectionLeaseExpiresAt: { lte: now } }] },
+        ],
+      },
+      data: { projectionStatus: "processing", processingStartedAt: now, projectionLeaseOwner: leaseOwner, projectionLeaseExpiresAt: new Date(now.getTime() + leaseSeconds * 1_000) },
+    });
+    return result.count === 1;
+  }
+  async markProjectionProcessed(eventId: string, leaseOwner: string): Promise<void> {
+    await this.db.indexedEvent.updateMany({
+      where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner },
+      data: {
+        projectionStatus: "processed",
+        processedAt: new Date(),
+        processingStartedAt: null,
+        projectionLeaseOwner: null,
+        projectionLeaseExpiresAt: null,
+        nextProjectionAttemptAt: null,
+        lastProjectionError: null,
+      },
+    });
+  }
+  async markProjectionFailed(eventId: string, leaseOwner: string, error: string): Promise<void> {
+    const current = await this.db.indexedEvent.findFirst({ where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner }, select: { projectionAttempts: true } });
+    if (!current) return;
+    const attempts = current.projectionAttempts + 1;
+    await this.db.indexedEvent.updateMany({
+      where: { id: eventId, projectionStatus: "processing", projectionLeaseOwner: leaseOwner },
+      data: {
+        projectionStatus: "failed",
+        projectionAttempts: attempts,
+        lastProjectionError: error.slice(0, 2_000),
+        processingStartedAt: null,
+        projectionLeaseOwner: null,
+        projectionLeaseExpiresAt: null,
+        nextProjectionAttemptAt: new Date(Date.now() + Math.min(300_000, 1_000 * 2 ** Math.min(attempts, 8))),
+      },
+    });
+  }
+}
+
+function jsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item)) as Prisma.InputJsonValue;
 }
 
 export class PostgresActionLedger {

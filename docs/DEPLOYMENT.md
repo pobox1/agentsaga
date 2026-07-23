@@ -35,3 +35,27 @@ forge script contracts/script/DeployArcTestnet.s.sol:DeployArcTestnet \
 After confirmation, record transaction receipts and addresses in `deployments/arc-testnet.json`,
 verify source on ArcScan, then run `pnpm --filter @agentsaga/contracts verify:deployment` with the
 recorded addresses. Do not create the deployment JSON before those values exist onchain.
+# Persistent orchestrator processes
+
+The orchestrator is not a Vercel serverless workload. Deploy the compiled package as four independently restarted processes sharing PostgreSQL, Redis and the same deployment configuration:
+
+```text
+pnpm --filter @agentsaga/orchestrator start
+pnpm --filter @agentsaga/orchestrator start:worker
+pnpm --filter @agentsaga/orchestrator start:indexer
+pnpm --filter @agentsaga/orchestrator start:scheduler
+```
+
+Production configuration requires `DATABASE_URL`, `REDIS_URL`, at least one API token, `WORKFLOW_FACTORY_ADDRESS`, `FACTORY_DEPLOYMENT_BLOCK`, `OPERATION_MODE`, and an allowlisted `CORS_ORIGINS`. Run every Prisma migration before starting any process.
+
+All four processes load the same validated capability configuration and publish its version and hash. `/ready` separates `coreReady` from `autonomousReady`. Core readiness requires Arc RPC, PostgreSQL, Redis, every repository migration applied with no failed or unfinished migration, queue access, deployment configuration, indexer cursor, and compatible fresh worker/indexer/scheduler heartbeats. Autonomous readiness additionally requires factual worker dependencies: registered processors, matching ready role signers and available agent/evaluator adapters. Manual and hybrid modes may serve HTTP 200 for core readiness while returning `autonomousReady: false`; autonomous mode returns HTTP 503 unless both levels are ready.
+
+Configure `SIGNER_CONFIG_JSON` as versioned, workflow/node/role-scoped JSON. Supported backends are `disabled`, `manual`, `encrypted-local`, `circle`, and named `external` adapters. Encrypted local signers require an encrypted envelope plus a separately injected passphrase environment variable and are rejected in production unless `ALLOW_ENCRYPTED_LOCAL_SIGNERS=true` is explicitly set. Never place a plaintext private key in configuration. Configure separate owner/operator, provider, evaluator, compensation-provider, compensation-evaluator, permissionless-expiry, and Circle signer scopes. The runtime verifies status and selected address against fresh onchain role data before simulation and submission. Waiting prerequisites are durable PostgreSQL state; the scheduler leases and resumes them without consuming execution failure retries.
+
+Indexer ingestion and projection are separate durable stages. Raw logs are unique by chain/source/block/transaction/log index; projection moves through `received`, `processing`, `processed`, and `failed`, with attempts, errors, and a retry schedule. Readiness and metrics expose projection backlog and failures.
+
+Projection is strict per source: `(blockNumber, logIndex)` is the only execution order, a retrying head blocks later events, and processing leases are owner-fenced and recover after expiry. Receipt events remain pending until their workflow and receipt-registry RPC dependencies are available.
+
+All database-to-BullMQ transitions use the PostgreSQL queue outbox. The worker continuously recovers expired publisher leases and repairs `queued` actions whose deterministic BullMQ job is absent or already terminal. Monitor `agentsaga_queue_outbox_backlog`.
+
+Before an onchain signer is called, the worker persists a calldata-bound `TransactionIntent`. The intent changes to `broadcast_unknown` before the external call and to `submitted` only after the returned hash is atomically stored. An unknown broadcast is deliberately not resent automatically; monitor `agentsaga_unknown_broadcast_intents` and reconcile it through the original signer/RPC provider before any explicit replacement decision.

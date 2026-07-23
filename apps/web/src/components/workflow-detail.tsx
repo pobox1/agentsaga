@@ -11,6 +11,8 @@ const fields = [
   "paymentToken",
   "jobAdapter",
   "status",
+  "finalized",
+  "activationMask",
   "nodeCount",
   "totalBudget",
   "deposited",
@@ -74,7 +76,7 @@ export function WorkflowDetail({ address }: { address: Address }) {
           return <div className="bitmap-node" key={id}><span>{String(id + 1).padStart(2, "0")}</span><strong>{state}</strong></div>;
         })}</div></div>
         <div className="panel proof-fields"><h2>Cryptographic commitments</h2><ProofField label="Workflow specification" value={String(value("workflowSpecificationHash") ?? "—")} /><ProofField label="Evidence accumulator" value={String(value("evidenceAccumulator") ?? "—")} /><ProofField label="Execution trace" value={String(value("executionTraceHash") ?? "—")} /></div>
-        <WorkflowActions workflow={address} owner={value("owner") as Address | undefined} token={value("paymentToken") as Address | undefined} adapter={value("jobAdapter") as Address | undefined} nodeCount={nodeCount} totalBudget={bigintValue("totalBudget")} deposited={bigintValue("deposited")} />
+        <WorkflowActions workflow={address} owner={value("owner") as Address | undefined} token={value("paymentToken") as Address | undefined} adapter={value("jobAdapter") as Address | undefined} nodeCount={nodeCount} totalBudget={bigintValue("totalBudget")} deposited={bigintValue("deposited")} status={status} finalized={Boolean(value("finalized"))} activationMask={Number(value("activationMask") ?? 0)} reservedForJobs={bigintValue("reservedForJobs")} />
       </section>
       <aside className="detail-aside"><div className="panel"><p className="eyebrow">Vault liabilities</p><dl className="summary-list"><div><dt>Available</dt><dd>{money("available")}</dd></div><div><dt>Jobs reserved</dt><dd>{money("reservedForJobs")}</dd></div><div><dt>Compensation reserved</dt><dd>{money("reservedForCompensation")}</dd></div><div><dt>Protocol fees</dt><dd>{money("protocolFees")}</dd></div></dl><a className="button button-quiet button-full" href={`https://testnet.arcscan.app/address/${address}`} target="_blank" rel="noreferrer">Open in ArcScan</a><Link className="text-link" href={`/receipts/${address}`}>Open final receipt →</Link></div></aside>
     </div>
