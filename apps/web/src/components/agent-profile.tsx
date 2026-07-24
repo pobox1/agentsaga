@@ -16,7 +16,7 @@ export function AgentProfile({ agentId }: { agentId: string }) {
   const owner = reads.data?.[0]?.status === "success" ? reads.data[0].result : undefined;
   const uri = reads.data?.[1]?.status === "success" ? reads.data[1].result : undefined;
   const error = reads.data?.find((result) => result.status === "failure");
-  return <section className="panel"><p className="eyebrow">Official Arc Testnet ERC-8004 registry</p><h2>Agent #{agentId}</h2>
+  return <section className="panel"><p className="eyebrow">Arc Testnet ERC-8004 infrastructure</p><h2>Agent #{agentId}</h2>
     {error || !owner ? <p>Registry lookup failed or this token does not exist. No owner or reputation is inferred.</p> : <div className="proof-fields">
       <Proof label="On-chain owner" value={owner} />
       <Proof label="Metadata URI" value={uri || "empty"} />

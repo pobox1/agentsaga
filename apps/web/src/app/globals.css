@@ -37,6 +37,7 @@ h3 { font-size: 1.1rem; }
 .header-inner { width: min(1320px, calc(100% - 32px)); height: 70px; margin-inline: auto; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 24px; }
 .brand { display: inline-flex; align-items: center; gap: 11px; font-weight: 650; width: fit-content; }
 .brand-mark { width: 29px; height: 29px; display: grid; place-items: center; color: var(--lime-ink); background: var(--lime); border-radius: 8px; font: 700 .64rem var(--font-geist-mono); }
+.brand small { color: var(--dim); font: 600 .62rem var(--font-geist-mono); text-transform: uppercase; letter-spacing: 0; }
 nav { display: flex; gap: 5px; }
 nav a { color: var(--muted); font-size: .86rem; padding: 9px 12px; border-radius: 9px; }
 nav a:hover, nav a:focus-visible { color: var(--ink); background: var(--panel-2); }
@@ -233,7 +234,7 @@ input:disabled { opacity: .5; }
   .shell, .narrow-shell { width: min(100% - 24px, 1240px); }
   .page-shell { padding-block: 50px 90px; }
   .header-inner { width: calc(100% - 24px); }
-  .brand > span:last-child { display: none; }
+  .brand small { display: none; }
   .hero { min-height: auto; padding-block: 65px; }
   .hero-ledger { padding: 20px; }
   .ledger-amount strong { font-size: 3.35rem; }

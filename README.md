@@ -1,17 +1,21 @@
-# AgentSaga
+# Saga
 
-Failure-safe settlement for multi-agent workflows, built on Arc.
+Failure-safe settlement for multi-agent workflows. Built on Arc.
 
-AgentSaga coordinates dependent agent jobs under one bounded USDC budget. The
+Saga is an independent application built on Arc Network. It coordinates dependent agent jobs under one bounded USDC budget. The
 onchain coordinator is the source of truth for funding, dependency activation,
 provider payouts, refunds, compensation, and a final workflow receipt. The
 repository includes a Foundry contract MVP, a provider-agnostic TypeScript
 orchestrator, deterministic x402 fixtures, and a Next.js frontend.
 
+This project is independently developed and is not an official Arc or Circle
+product. References to Arc describe the infrastructure used by the application
+and do not imply endorsement, partnership, certification, or sponsorship.
+
 ## Why this exists
 
 Single-job escrow can settle one task but cannot answer what happens to the
-rest of a dependent business workflow when a middle step fails. AgentSaga
+rest of a dependent business workflow when a middle step fails. Saga
 freezes affected descendants, pays only completed valid work, preserves a
 separately accounted compensation reserve, refunds unused USDC, and records the
 full economic history in a readable receipt.
@@ -64,7 +68,7 @@ project-owned contracts. See `docs/DEPLOYMENT.md` and
 
 ## Differentiation
 
-> AgentSaga is not a marketplace, wallet, evaluator, or single-job escrow. It
+> Saga is not a marketplace, wallet, evaluator, or single-job escrow. It
 > coordinates the financial lifecycle of multiple dependent agent jobs under
 > one bounded workflow budget and produces a verifiable workflow-level
 > settlement and compensation receipt.

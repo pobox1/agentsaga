@@ -26,11 +26,11 @@ export function AgentRegistry() {
   }
   const owner = reads.data?.[0]?.status === "success" ? reads.data[0].result : undefined;
   const uri = reads.data?.[1]?.status === "success" ? reads.data[1].result : undefined;
-  return <section className="panel"><p className="eyebrow">Official Arc Testnet ERC-8004 Identity Registry</p><h2>Inspect or register an agent</h2>
+  return <section className="panel"><p className="eyebrow">Arc Testnet ERC-8004 infrastructure</p><h2>Inspect or register an agent</h2>
     <label>Agent ID<input value={agentId} onChange={(event) => setAgentId(event.target.value)} inputMode="numeric" /></label>
     {owner && <div className="proof-fields"><Proof label="Verified onchain owner" value={owner} /><Proof label="Metadata URI" value={uri ?? ""} /></div>}
     <p>Capabilities, endpoints, validation records, and reputation references belong in the metadata document. Reputation is displayed as evidence, never automatically trusted.</p>
-    <label>New agent metadata URI<input value={metadataUri} onChange={(event) => setMetadataUri(event.target.value)} placeholder="ipfs://… or https://…" /></label>
+    <label>New agent metadata URI<input value={metadataUri} onChange={(event) => setMetadataUri(event.target.value)} placeholder="ipfs://... or https://..." /></label>
     <button className="button button-primary" type="button" onClick={register}>Register with connected wallet</button>
     {message && <p className="form-message">{message}</p>}
   </section>;

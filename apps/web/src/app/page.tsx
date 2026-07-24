@@ -18,8 +18,8 @@ export default function HomePage() {
           <p className="eyebrow">Workflow-level financial safety</p>
           <h1>When one agent fails, the money still has to add up.</h1>
           <p className="hero-lede">
-            Multi-agent workflows can fail halfway through. AgentSaga keeps their budgets,
-            dependencies, payouts, refunds, and compensations consistent on Arc.
+            Multi-agent workflows can fail halfway through. Saga keeps their budgets,
+            dependencies, payouts, refunds, and compensations consistent on Arc Network infrastructure.
           </p>
           <div className="button-row">
             <Link className="button button-primary" href="/workflows/new">
@@ -64,7 +64,7 @@ export default function HomePage() {
 
       <section className="section shell split-section">
         <div>
-          <p className="eyebrow">Refund ≠ rollback ≠ compensation</p>
+          <p className="eyebrow">Refund != rollback != compensation</p>
           <h2>Failure is represented honestly.</h2>
         </div>
         <div className="definition-list">
@@ -76,4 +76,3 @@ export default function HomePage() {
     </main>
   );
 }
-

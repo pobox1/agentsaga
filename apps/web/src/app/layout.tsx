@@ -8,8 +8,8 @@ const geist = Geist({ subsets: ["latin"], variable: "--font-geist" });
 const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
 
 export const metadata: Metadata = {
-  title: { default: "AgentSaga", template: "%s · AgentSaga" },
-  description: "Failure-safe settlement for multi-agent workflows, built on Arc.",
+  title: { default: "Saga", template: "%s · Saga" },
+  description: "Failure-safe settlement for multi-agent workflows. Built on Arc.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
@@ -20,7 +20,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           <SiteHeader />
           {children}
           <footer className="site-footer">
-            <span>AgentSaga · Arc Testnet · not audited</span>
+            <span>Saga · Built on Arc · testnet only · not audited</span>
             <span>Compensation is an explicit action, never a claim of reversal.</span>
           </footer>
         </Providers>
@@ -28,4 +28,3 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     </html>
   );
 }
-

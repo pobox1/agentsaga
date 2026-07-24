@@ -14,9 +14,10 @@ export function SiteHeader() {
   return (
     <header className="site-header">
       <div className="header-inner">
-        <Link className="brand" href="/" aria-label="AgentSaga home">
-          <span className="brand-mark" aria-hidden="true">AS</span>
-          <span>AgentSaga</span>
+        <Link className="brand" href="/" aria-label="Saga home">
+          <span className="brand-mark" aria-hidden="true">S</span>
+          <span>Saga</span>
+          <small>Built on Arc</small>
         </Link>
         <nav aria-label="Primary navigation">
           {links.map(([label, href]) => (
