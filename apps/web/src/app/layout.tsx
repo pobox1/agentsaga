@@ -21,7 +21,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           {children}
           <footer className="site-footer">
             <span>Saga · Built on Arc · testnet only · not audited</span>
-            <span>Compensation is an explicit action, never a claim of reversal.</span>
+            <span>Arc is a trademark of Circle Internet Group, Inc. and/or its affiliates.</span>
           </footer>
         </Providers>
       </body>

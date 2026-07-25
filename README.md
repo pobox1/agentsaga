@@ -11,6 +11,7 @@ orchestrator, deterministic x402 fixtures, and a Next.js frontend.
 This project is independently developed and is not an official Arc or Circle
 product. References to Arc describe the infrastructure used by the application
 and do not imply endorsement, partnership, certification, or sponsorship.
+Arc is a trademark of Circle Internet Group, Inc. and/or its affiliates.
 
 ## Why this exists
 
